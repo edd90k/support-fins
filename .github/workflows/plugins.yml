@@ -1,0 +1,502 @@
+name: plugins
+
+# Rebuild and test the plugins whenever something they use changes. Orca bundles
+# the site's engine (web/*.js) at build time, so a site change only reaches Orca
+# users through a rebuild: this makes that rebuild automatic, and makes a site
+# change that breaks a plugin fail the PR that made it.
+#
+#   PR:            build + test
+#   push to main:  build + test, then publish the builds to the rolling
+#                  `plugins-latest` pre-release (printfins.com's Plugins menu links here)
+#   GitHub Release: build + test, then attach plugin builds and publish the
+#                   versioned Docker image. Stable releases also move `latest`.
+#   called / dispatched with a `tag`: the same as a GitHub Release for that tag (release.yml
+#                   creates one on each release run and calls this for it).
+#
+# The Fusion add-in runs the engine in Fusion's own browser (a hidden palette), so
+# its zip has nothing native in it and serves Windows and macOS alike. It has been
+# run in Fusion on Windows and on an Apple-silicon Mac.
+#
+# Not here: the shared engine's Deno tests (plugins/shared/tests) already run in
+# test.yml. Onshape is published from its Onshape document, so there is nothing
+# to build.
+
+on:
+  pull_request:
+    paths:
+      - 'web/**'
+      - 'plugins/**'
+      - '.github/workflows/plugins.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'plugins/**'
+      - '.github/workflows/plugins.yml'
+  release:
+    types: [published]
+  # release.yml calls this for each release it creates: a release made with the
+  # workflow's GITHUB_TOKEN does not fire the `release` event above. Dispatching it by
+  # hand with a tag (run it on that tag's ref) rebuilds a release's assets and image.
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach builds to and publish as a Docker image'
+        type: string
+        required: false
+        default: ''
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag (run on that tag), or empty for an ordinary build'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  orca:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - name: Install test dependencies
+        # mini-racer pinned to the version the plugin's PEP 723 header asks Orca for
+        run: pip install pytest numpy trimesh scipy shapely rtree networkx mini-racer==0.14.1
+      - name: Build
+        run: python plugins/orca/build.py
+      - name: Test
+        run: python -m pytest -q plugins/orca/tests/
+      - name: Test the shared Python modules (host, slicer)
+        run: python -m pytest -q plugins/shared/py/tests/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orca
+          path: plugins/orca/build/support_fins_orca.py
+          if-no-files-found: error
+
+  fusion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # esbuild via npx, and Node runs the engine in the tests
+        with:
+          node-version: '22'
+      - name: Build (engine bundle + SupportFins.zip)
+        run: python plugins/fusion/build.py --zip
+      - name: Test
+        run: python -m unittest discover -s plugins/fusion/tests -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusion
+          path: plugins/fusion/build/SupportFins.zip
+          if-no-files-found: error
+
+  cura:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - name: Install test dependencies
+        run: pip install pytest numpy mini-racer==0.14.1
+      - name: Build a .curapackage per platform
+        # pip fetches each platform's mini-racer wheel, so one Linux runner builds all five;
+        # this runner's own (linux-x64) is built last and is what the tests run against
+        run: python plugins/cura/build.py --all
+      - name: Test
+        run: python -m pytest -q plugins/cura/tests/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cura
+          path: plugins/cura/build/*.curapackage
+          if-no-files-found: error
+
+  freecad:
+    # The add-on's settings mapping, then a zip per platform (engine bundle + that
+    # platform's mini-racer). FreeCAD itself isn't installable here:
+    # plugins/freecad/tests/smoke.py runs the real thing locally.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Test
+        run: python -m pytest -q plugins/freecad/tests/test_props.py
+      - name: Build a zip per platform
+        run: python plugins/freecad/build.py --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freecad
+          path: plugins/freecad/build/support-fins-freecad-*.zip
+          if-no-files-found: error
+
+  cli:
+    # The command line as one file (its tests run with the rest in test.yml's deno test):
+    # bundled, then run on Node from outside the checkout, so a missed import fails here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - name: Build
+        run: python plugins/cli/build.py
+      - name: Run it outside the checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/cli" && cp plugins/cli/build/support-fins.mjs prototype/stress/models/lowledge.stl "$RUNNER_TEMP/cli/"
+          cd "$RUNNER_TEMP/cli" && node support-fins.mjs lowledge.stl && test -s lowledge-fins.3mf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli
+          path: plugins/cli/build/support-fins.mjs
+          if-no-files-found: error
+
+  mcp:
+    # The MCP server as one file (its tests run with the rest in test.yml's deno test):
+    # bundled, then driven over stdio on Node from outside the checkout -- initialize,
+    # then fin a part -- so a missed import or a stray stdout line fails here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - name: Build
+        run: python plugins/mcp/build.py
+      - name: Run it outside the checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/mcp" && cp plugins/mcp/build/support-fins-mcp.mjs prototype/stress/models/lowledge.stl "$RUNNER_TEMP/mcp/"
+          cd "$RUNNER_TEMP/mcp"
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fin_part","arguments":{"path":"lowledge.stl"}}}' \
+            | node support-fins-mcp.mjs > replies.jsonl
+          cat replies.jsonl
+          node -e 'const l=require("fs").readFileSync("replies.jsonl","utf8").trim().split("\n").map(JSON.parse); if (l.length!==2||l[1].result.isError!==false) process.exit(1)'
+          test -s lowledge-fins.3mf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp
+          path: plugins/mcp/build/support-fins-mcp.mjs
+          if-no-files-found: error
+
+  blender:
+    # The extension's settings mapping + 3MF writer, then a zip per platform (engine
+    # bundle + that platform's mini-racer wheel, which Blender installs itself).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - name: Install test dependencies
+        run: pip install pytest mini-racer==0.14.1
+      - name: Test
+        run: python -m pytest -q plugins/blender/tests/
+      - name: Build
+        run: python plugins/blender/build.py --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blender
+          path: plugins/blender/build/support_fins-*.zip
+          if-no-files-found: error
+
+  rhino:
+    # The Rhino 8 plugin's settings mapping, mesh weld and staged project (rhinocode,
+    # which compiles the .yak, needs Rhino: built locally; rhino_smoke.py runs in Rhino).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'     # Rhino 8's CPython
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - name: Install test dependencies
+        run: pip install pytest numpy mini-racer==0.12.4   # the commands' # r: pin (0.13+ needs 3.10)
+      - name: Test
+        run: python -m pytest -q plugins/rhino/tests/
+      - name: Stage the project
+        run: python plugins/rhino/build.py
+
+  blender-smoke:
+    # Install the Linux zip into a real headless Blender (the oldest it supports and
+    # a current one) and use it: Generate, out of date, settings, units, Draw wall, Lay face flat, 3MF, overlays, Clear.
+    needs: blender
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['4.2.23', '5.2.2']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: blender
+          path: plugins/blender/build
+      - name: Install Blender's system libraries
+        run: sudo apt-get update -q && sudo apt-get install -y -q libx11-6 libxi6 libxrender1 libxfixes3 libxxf86vm1 libgl1 libsm6 libice6 libxkbcommon0
+      - name: Smoke test in Blender ${{ matrix.version }}
+        run: python plugins/blender/tests/run_blender.py --version '${{ matrix.version }}' --package plugins/blender/build/support_fins-linux-x64.zip
+
+  prusa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - name: Install Lua
+        run: sudo apt-get update -q && sudo apt-get install -y -q lua5.4 && lua -v && luac -v
+      - name: Test
+        run: bash plugins/prusa/run-tests.sh
+      - name: Package
+        # the slicer loads the bundle folder: the folder zipped, its manifest stamped with the version
+        run: python3 plugins/prusa/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prusa
+          path: plugins/prusa/build/support-fins-prusa.zip
+          if-no-files-found: error
+
+  solidworks:
+    # The add-in, built on Linux: it targets .NET Framework 4.8 through reference
+    # assemblies and SolidWorks' interop is compile-time only. Its page's tests run
+    # with the rest in test.yml's deno test; SolidWorks itself isn't installable here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # plugins/shared/version.py numbers the build from main's history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # npx fetches the pinned esbuild (plugins/shared/bundle.py)
+        with:
+          node-version: '22'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build
+        run: python plugins/solidworks/build.py --zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solidworks
+          path: plugins/solidworks/build/support-fins-solidworks.zip
+          if-no-files-found: error
+
+  publish:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'release' || inputs.tag != ''
+    needs: [orca, fusion, cura, prusa, blender, blender-smoke, freecad, cli, mcp, solidworks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      # Its own group per tag: one group holds a single pending run, so a shared one could
+      # cancel a queued release publish behind another (a release with no builds, no image).
+      group: plugins-publish-${{ inputs.tag || github.event.release.tag_name || 'rolling' }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate release version and target
+        if: env.RELEASE_TAG != ''
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          tag = os.environ["RELEASE_TAG"]
+          match = re.fullmatch(
+              r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+              r"(?:-([0-9A-Za-z.-]+))?",
+              tag,
+          )
+          if not match:
+              sys.exit(
+                  f"Release tag {tag!r} must use Docker-compatible SemVer with a leading v, "
+                  "e.g. v0.1.0 or v0.2.0-rc.1 (build metadata is not supported)."
+              )
+          if len(tag) > 128:
+              sys.exit(f"Release tag {tag!r} is longer than Docker's 128-character tag limit")
+
+          prerelease = match.group(4)
+          if prerelease is not None:
+              parts = prerelease.split(".")
+              if any(not part for part in parts):
+                  sys.exit(f"Invalid empty identifier in SemVer prerelease: {tag}")
+              if any(not re.fullmatch(r"[0-9A-Za-z-]+", part) for part in parts):
+                  sys.exit(f"Invalid identifier in SemVer prerelease: {tag}")
+              if any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in parts):
+                  sys.exit(f"Numeric prerelease identifiers cannot have leading zeroes: {tag}")
+          PY
+          git fetch origin main --no-tags
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release commit $GITHUB_SHA is not reachable from main; refusing to publish." >&2
+            exit 1
+          fi
+      - uses: actions/setup-python@v5   # release_labels.py needs 3.11+ (tomllib)
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4     # release_labels.py runs esbuild (npx) for the versions
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Move rolling plugin tag
+        if: github.event_name == 'push' && env.RELEASE_TAG == ''
+        env:
+          TAG: plugins-latest
+        run: |
+          git tag -f "$TAG"
+          git push -f origin "refs/tags/$TAG"
+      - name: Update rolling plugin release
+        if: github.event_name == 'push' && env.RELEASE_TAG == ''
+        env:
+          TAG: plugins-latest
+        run: |
+          notes="Built automatically from ${GITHUB_SHA::7} on main. Replaced on every push that touches web/ or plugins/.
+
+          - support_fins_orca.py: OrcaSlicer plugin (2.5 nightly), experimental
+          - SupportFins.zip: Autodesk Fusion add-in, experimental (run on Windows and macOS)
+          - SupportFins-<platform>.curapackage: UltiMaker Cura 5 plugin, experimental; pick your computer's (mac-arm64, mac-x64, windows-x64, linux-x64, linux-arm64) and drag it onto Cura
+          - support-fins-prusa.zip: PrusaSlicer 3.0 plugin bundle, placement by hand
+          - support_fins-<platform>.zip: Blender 4.2+ extension, experimental; pick your computer's (macos-arm64, macos-x64, windows-x64, linux-x64) and use Install from Disk
+          - support-fins-freecad-<platform>.zip: FreeCAD 1.0 add-on, experimental; pick your computer's (mac-arm64, mac-x64, windows-x64, linux-x64, linux-arm64) and unzip into FreeCAD's Mod folder
+          - support-fins-solidworks.zip: SolidWorks add-in (Windows), experimental, not yet run in SolidWorks; unzip, run install.bat as administrator
+          - support-fins.mjs: command line (Deno or Node 20.10+): node support-fins.mjs part.stl
+          - support-fins-mcp.mjs: MCP server for AI clients (Claude Code, Claude Desktop; Deno or Node 20.10+): claude mcp add support-fins -- node /full/path/to/support-fins-mcp.mjs
+
+          Each file's label names its plugin version and the engine commit it was built from. A plugin's version (0.7.<n>) is the position on main of the last commit that changed what it ships, so it changes exactly when the plugin does."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Plugins (latest build)" --notes "$notes" --prerelease
+          else
+            gh release create "$TAG" --title "Plugins (latest build)" --notes "$notes" --prerelease --verify-tag
+          fi
+      - name: Generate plugin asset labels
+        run: python3 plugins/shared/release_labels.py dist "$GITHUB_SHA" > labels.txt
+      - name: Upload builds to rolling plugin release
+        if: github.event_name == 'push' && env.RELEASE_TAG == ''
+        env:
+          TAG: plugins-latest
+        run: xargs -d '\n' gh release upload "$TAG" --clobber < labels.txt
+      - name: Attach plugin builds to this GitHub Release
+        if: env.RELEASE_TAG != ''
+        run: xargs -d '\n' gh release upload "$RELEASE_TAG" --clobber < labels.txt
+
+  docker-publish:
+    if: github.event_name == 'release' || inputs.tag != ''
+    needs: [publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Is this the newest stable release?
+        id: newest
+        # `latest` must never move backwards: a re-dispatch for an older tag leaves it be.
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          git fetch --tags --quiet
+          top=$(git tag --list 'v*' --sort=-v:refname | grep -v -- '-' | head -1)
+          if [ "$TAG" = "$top" ] && [ "$PRERELEASE" != "true" ]; then echo "latest=true" >> "$GITHUB_OUTPUT"; else echo "latest=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Prepare image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ inputs.tag || github.event.release.tag_name }}
+            type=raw,value=latest,enable=${{ steps.newest.outputs.latest == 'true' }}
+      - name: Build and publish Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

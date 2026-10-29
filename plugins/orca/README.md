@@ -19,19 +19,26 @@ So this plugin:
 1. reads the part as Orca slices it (`PrintObject.model_object()` volumes through
    `PrintObject.trafo()`),
 2. runs **the website's engine, unmodified** — `web/*.js` bundled with esbuild and
-   executed in an embedded V8 ([mini-racer](https://pypi.org/project/mini-racer/)),
-3. cross-sections the fin shells at every layer's `slice_z` and merges them into the
-   layer (Orca's own `union_ex` fuses the tines into the part).
+   executed in an embedded V8 ([mini-racer](https://pypi.org/project/mini-racer/)).
+   The bundle and its bridge are shared with the other plugins
+   ([`plugins/shared/`](../shared/README.md)),
+3. cross-sections the fin shells at every layer's `slice_z` (the shared mesh slicer,
+   `plugins/shared/py/supportfins_slice.py`) and merges them into the layer (Orca's
+   own `union_ex` fuses the tines into the part).
 
 No export, no re-import, no "fins land on the plate" API needed. Rotate the part,
 re-slice, and the fins follow. Parts with Orca's **Enable support** on are skipped,
 so the per-object support toggle picks fins vs Orca supports.
 
 ```
-python3 plugins/orca/build.py                   # -> build/support_fins_orca.py (one file, ~100 KB)
-deno test --allow-read tests/ plugins/orca/tests/
-python3 -m pytest -q plugins/orca/tests/        # needs numpy, trimesh, scipy, shapely, rtree, networkx, mini-racer
+python3 plugins/orca/build.py                   # -> build/support_fins_orca.py (one file, ~110 KB)
+deno test --allow-read tests/ plugins/shared/tests/
+python3 -m pytest -q plugins/orca/tests/ plugins/shared/py/tests/   # needs numpy, trimesh, scipy, shapely, rtree, networkx, mini-racer
 ```
+
+`src/support_fins_orca.py` holds only Orca glue. The build inlines the shared Python
+modules (`plugins/shared/py/`: V8 host, mesh slicer) at their `# __SUPPORTFINS_*__`
+marker lines, so the plugin still ships as one file.
 
 Install and turn on (OrcaSlicer 2.5 nightly):
 
@@ -42,21 +49,48 @@ Install and turn on (OrcaSlicer 2.5 nightly):
 2. Switch the process settings to **Advanced**, open **Others ▸ Slicing Pipeline
    Plugin ▸ Add plugin** and pick **Support Fins**. Activating the plugin alone does
    nothing; the process preset has to reference it.
-3. Slice. The first slice of each Orca session shows a few **Plugin permission
-   request** prompts (reading Python's own library files, and `socket.__new__`,
+3. Slice. Recent builds usually ask nothing: the engine now starts while the plugin
+   loads, before Orca's permission checks are on. If Orca does show a **Plugin
+   permission request** (reading Python's own library files, or `socket.__new__`,
    which is the local self-pipe of the asyncio loop mini-racer creates, not network
-   access). Answer Yes.
+   access), answer Yes.
+
+### Settings (the plugin config)
+
+The plugin's config is JSON. Besides its own two keys, `enabled` and `apply_to`
+(`"no-supports"` skips parts with Orca's Enable support on, `"all"` fins every part),
+it takes **every setting printfins.com and the other plugins have**: any key of
+[`plugins/shared/engine/options.json`](../shared/engine/options.json), in the engine's
+units, so a percent setting is the site's value / 100. Leave a key out to get the
+site's default (the default config holds only the plugin's two keys, so it follows the
+site when a default changes). For example:
+
+```json
+{"mode": "full", "gap": 0.3, "threshold": 50, "padStyle": "sure", "coverage": 0.7}
+```
+
+Calibration coupon results map straight across: `threshold` (angle), `gap`,
+`padStyle`. Layer height and nozzle size are always Orca's own (the nozzle is the wall
+extruder's `nozzle_diameter`), so `layerHeight` and `nozzle` are refused. A key the
+engine doesn't know, or a value out of range, fails the slice with the engine's
+message (`unknown dialog option sparkle`), instead of printing default fins. On/off
+settings take `true`/`false` (or `1`/`0`).
+Older configs' `tine_density` and `bed_pad: false` still work.
+
+Every key, its values and default, with ready-to-paste configs (Full coverage, ...):
+[docs/PLUGIN-CONFIG.md](../../docs/PLUGIN-CONFIG.md).
 
 ### What the tests pin (offline)
 
-* `tests/entry.test.js` — the Orca path places the same fins as the website on the
-  same posed part, anywhere on the plate; watertight; walls clear the part; tines bite.
+* `plugins/shared/tests/entry.test.js` — the plugin entry places the same fins as the
+  website on the same posed part, anywhere on the plate; watertight; walls clear the
+  part; tines bite.
 * `tests/test_plugin.py` — against `tests/fake_orca.py` (same shapes/units as the real
   bindings): every layer's islands match an **independent** trimesh+shapely slice of
   part + fins, including off-centre placement and XY/Z shrinkage compensation;
   supports-on parts, other steps and a disabled config change nothing; errors come
   back as `RecoverableError`, never an exception mid-slice.
-* `ENGINE-SENSITIVITY.md` — an upstream engine finding (tine placement moves under
+* `plugins/shared/ENGINE-SENSITIVITY.md` — an upstream engine finding (tine placement moves under
   1e-13 mm of noise) and how the plugin neutralises it.
 
 ### Checked in a real Orca build (2.5.0-dev nightly, Windows, 2026-09-23)

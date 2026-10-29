@@ -131,6 +131,9 @@ async function snap(name) {
 }
 
 const click = (id) => page.evaluate((id) => document.getElementById(id).click(), id);
+// A control a base build may not have yet (the toolbar badges, local issue 42):
+// clicked when present, so one script drives both sides of vs-base.sh.
+const clickIf = (id) => page.evaluate((id) => document.getElementById(id)?.click(), id);
 const setVal = (id, v, ev = 'change') => page.evaluate((id, v, ev) => {
   const e = document.getElementById(id);
   if (e.type === 'checkbox') e.checked = v; else e.value = v;
@@ -234,7 +237,7 @@ try {
   await click('redo'); await snap('redo');
 
   // Options panel.
-  await setVal('material', 'petg'); await snap('petg');
+  await setVal('gap', '0.3', 'input'); await snap('gap-0.3');
   await setVal('bed-pad', 'sure'); await snap('pad-sure');
   await setVal('bed-pad', 'custom'); await snap('pad-custom');
   await setVal('pad-gap', '0.2', 'input'); await snap('pad-custom-gap');
@@ -246,13 +249,11 @@ try {
   await setVal('cutout', 'diamond'); await snap('cutout');
   await setVal('coverage', '80', 'input'); await snap('coverage-80');
 
-  // Draw mode: a wall across the overhang, then undo / clear / their undos.
+  // Draw mode: a wall across the overhang, then clear and its undo.
   await setVal('fin-mode', 'draw'); await snap('draw-mode');
   await clickFace(extremeOverhang(1)); await snap('draw-first');
   await clickFace(extremeOverhang(-1)); await snap('draw-second');
   await page.keyboard.press('Escape'); await snap('draw-esc');
-  await click('draw-undo'); await snap('draw-undo');
-  await click('undo'); await snap('undo-draw-undo');
   await click('draw-clear'); await snap('draw-clear');
   await click('undo'); await snap('undo-clear');
 
@@ -276,11 +277,11 @@ try {
   await snap('laid');
   await click('undo'); await snap('undo-lay');
 
-  // Suggest orientation.
-  await click('suggest-orient'); await sleep(1500); await snap('suggest');
+  // Suggest orientation (its toolbar badge opens the popover, then the button ranks).
+  await clickIf('suggest-badge'); await click('suggest-orient'); await sleep(1500); await snap('suggest');
   await page.evaluate(() => document.querySelector('#suggest-list button:nth-child(2)')?.click());
   await snap('suggest-2');
-  await click('suggest-toggle'); await snap('suggest-collapsed');
+  await clickIf('suggest-badge'); await snap('suggest-collapsed');
   await click('rot-reset'); await snap('rot-reset');
 
   // Fins off / on, threshold, build volume, then a run of undos.
@@ -341,7 +342,7 @@ try {
   await snap('3mf-loaded');
 
   // Back to a preset build volume (the remembered choice is part of the step),
-  // then both export buttons, capturing each download's name and byte size.
+  // then every export format, capturing each download's name and byte size.
   await setVal('volume', '220 × 220 × 250 mm'); await snap('vol-preset');
   steps.at(-1).stored = await page.evaluate(() => localStorage.getItem('sf.volume'));
   await page.evaluate(() => {
@@ -352,7 +353,9 @@ try {
       if (this.download) window.__dl.push({ name: this.download, size: window.__dlSize });
     };
   });
-  await click('export'); await click('export-3mf');
+  for (const id of ['export-stl', 'export-3mf', 'export-fins']) {
+    await click('export'); await click(id);
+  }
   await snap('exported');
   steps.at(-1).downloads = await page.evaluate(() => window.__dl);
 
@@ -377,11 +380,11 @@ try {
     await click('suggest-orient'); await sleep(100); await ranked(); await snap(`${m}-suggest`);
   }
   await importFile(join(MODELS, 'tube.stl'), 'tube.stl');
-  await click('suggest-orient'); await sleep(100); await ranked();
+  await clickIf('suggest-badge'); await click('suggest-orient'); await sleep(100); await ranked();
   await page.evaluate(() => document.querySelector('#suggest-list button')?.click());
   await snap('suggest-best');
-  await click('suggest-toggle'); await snap('suggest-closed');
-  await click('suggest-toggle'); await snap('suggest-reopened');
+  await clickIf('suggest-badge'); await snap('suggest-closed');
+  await clickIf('suggest-badge'); await snap('suggest-reopened');
 
   // A manual turn drops the highlighted row (the list stays): a 90° button, a
   // gizmo ring drag (driven through its own events), then a lay-flat.
@@ -392,7 +395,10 @@ try {
   await pickRow(2);
   await page.evaluate(() => {
     let g = null;
-    window.__sf.part.parent.traverse((o) => { if (o.isTransformControlsRoot) g = o.controls; });
+    // the rotate rings' gizmo (the one on the part), not the Section plane's
+    window.__sf.part.parent.traverse((o) => {
+      if (o.isTransformControlsRoot && o.controls.object === window.__sf.part) g = o.controls;
+    });
     g.dispatchEvent({ type: 'dragging-changed', value: true });
     window.__sf.part.rotateZ(Math.PI / 6);
     g.dispatchEvent({ type: 'dragging-changed', value: false });
@@ -451,6 +457,20 @@ try {
   await clickFace(extremeOverhang(1)); await snap('half-wall');
   const half = await screenOf('return [0, 0, 0];');
   await page.mouse.click(half.x, half.y, { button: 'right' }); await snap('half-wall-rightclick');
+
+  // Leftover UI: Undo while "Lay a face flat" is armed, then a new part loaded
+  // with lay-flat and "+ Add walls by hand" armed and a Suggest list up. The new
+  // part must come in with every one of those reset.
+  await click('rot-x'); await settle();
+  await click('lay-face'); await snap('lay-armed-before-undo');
+  await click('undo'); await snap('undo-while-lay-armed');
+  await setVal('fin-mode', 'auto'); await settle();
+  await click('suggest-orient'); await sleep(100); await ranked();
+  await click('augment-toggle');
+  await click('lay-face'); await snap('armed-before-load');
+  const other = model.endsWith('/cone.stl') ? 'lbracket.stl' : 'cone.stl';
+  await importFile(join(MODELS, other), other);
+  await snap('load-while-armed');
 } catch (err) {
   errors.push(`harness: ${err.message}`);
 }

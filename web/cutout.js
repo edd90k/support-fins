@@ -1,7 +1,7 @@
 /**
  * WALL CUTOUTS (issue #34) -- holes through a breakaway wall to save filament.
  *
- * prop.js sweeps each wall as per-station cross-sections and hands them here;
+ * prop/sweep.js sweeps each wall as per-station cross-sections and hands them here;
  * cutWall either emits the wall with holes or returns false, and the caller
  * emits it solid as before. Everything is in the wall's own (s, z) plane: s runs
  * along the wall, z up. The pattern choice lives here (CUT.pattern), set by the
@@ -13,8 +13,9 @@ import { ribbon, boxExtrude } from './solids.js';
 // FOOT, so the middle of a tall wall can be opened up to save filament. The
 // holes are shaped so the wall still prints with no support of its own: every
 // edge that roofs a hole climbs at CUT.slope (~55deg from horizontal) or
-// steeper, so no layer ever bridges open air. That rules out circles, hexagons
-// and slots with flat tops, and leaves the shapes below.
+// steeper, so no layer ever bridges open air. That rules out circles, flat-topped
+// hexagons and slots with flat tops, and leaves the shapes below (the honeycomb's
+// hexagons stand on a corner, stretched until their roofs are that steep).
 //
 // A cut wall is still built the repo's way: overlapping closed solids that the
 // slicer unions. A solid TOP BAND (the breakaway tip + a rail under it, so the
@@ -41,6 +42,15 @@ export const CUT = {
   latSlope: 1.5,  // strut rise per unit across (~56deg), steeper than `slope`
   roofMin: 1.0,   // a clipped lattice hole's roof may be as flat as 45deg, no flatter
   minArea: 3.0,   // smallest lattice hole worth cutting, mm2
+  // HONEYCOMB: hexagons stood on a corner in staggered rows, the solid left an even
+  // strut between every pair -- the lattice's diagonals plus short VERTICAL struts
+  // between neighbours in a row (each under the next row's hexagon, so the load
+  // still zig-zags down: whether that is stiffer is the cutout coupon's question).
+  hexPitch: 6.0,  // centre-to-centre along a row, mm
+  hexStrut: 1.2,  // strut width, measured square to the strut, mm
+  hexSlope: 1.4,  // roof rise per unit across (~55deg); 1/sqrt(3) is a regular hexagon,
+                  // whose 30deg roofs the cutout coupon's HEX30 ledge prints -- below
+                  // roofMin it is honoured as set, so only the coupon ever sets it
   minSaved: 0.10, // a wall whose holes open less of its face than this stays solid
 };
 
@@ -52,14 +62,15 @@ export const CUT = {
  *   diamond  -- the lattice look; roof and floor both slope
  *   triangle -- flat floor, pointed roof (a truss)
  *   arch     -- a slot with a pointed, gothic roof; the most open of the three
- * plus 'lattice' (see latticeHoles), which isn't one hole per cell.
+ * plus 'lattice' and 'honeycomb' (latticeHoles, honeycombHoles), which aren't one
+ * hole per cell.
  */
 const HOLES = {
   diamond:  { prof: [[0, 0], [1, 0.5], [0, 1]], roof: 0.5 },
   triangle: { prof: [[1, 0], [0, 1]], roof: 1 },
   arch:     { prof: [[1, 0], [1, null], [0, 1]], roof: null },   // null: set by slope
 };
-export const CUTOUT_PATTERNS = ['none', ...Object.keys(HOLES), 'lattice'];
+export const CUTOUT_PATTERNS = ['none', ...Object.keys(HOLES), 'lattice', 'honeycomb'];
 
 /**
  * The holes that fit a cell `w` wide and `H` tall, as [{a, z0, z1}] (half-width,
@@ -148,23 +159,12 @@ function roofsOk(P, k) {
 }
 
 /**
- * LATTICE: diamonds in staggered rows over the whole hole zone, the solid left
- * between them a truss of diagonal struts. The zone is the wall's REAL outline
- * (under the top rail, over the foot rail, between the end posts), so on a
- * triangular fin the lattice runs right up the slope instead of stopping at
- * the first cell that is short at one end.
- *
- * At the edges each diamond is clipped to the zone, and kept if every roof it
- * ends up with still rises at CUT.roofMin (45deg) -- a slope as steep as that
- * becomes a hole's roof, so a fin under a 45deg face gets triangles hugging it.
- * A flatter edge would leave a bridge, so there the diamond is shrunk instead
- * until it fits whole. Anything smaller than a useful hole is left solid.
+ * The clip shared by the patterns that tile the whole zone (lattice, honeycomb):
+ * a function taking a convex CCW hole and returning it fitted to the zone's real
+ * outline, or null when no useful hole is left. Roofs the clip leaves flatter than
+ * `roofMin` are cut back to it.
  */
-function latticeHoles(s, zLo, zHi, sA, sB) {
-  const k = CUT.latSlope, p = CUT.latPitch;
-  const inset = CUT.latStrut / 2 / (k / Math.hypot(1, k));   // strut half-width, measured flat
-  const a = p / 2 - inset, b = k * a;
-  if (a < CUT.minHalf) return [];
+function zoneFit(s, zLo, zHi, sA, sB, roofMin) {
   // the zone's edges as half-planes, one per station segment (convex clip is
   // conservative where the outline bends: the hole only ever gets smaller)
   const segs = [];
@@ -188,25 +188,25 @@ function latticeHoles(s, zLo, zHi, sA, sB) {
     // A roof clipped to a zone edge flatter than roofMin would be a bridge. Rather
     // than give the hole up, drop that roof to exactly roofMin from its HIGH
     // corner: the hole keeps its reach along the slope with a printable roof.
-    for (let pass = 0; pass < 4 && P.length >= 3 && !roofsOk(P, CUT.roofMin); pass++) {
+    for (let pass = 0; pass < 4 && P.length >= 3 && !roofsOk(P, roofMin); pass++) {
       for (let n = 0; n < P.length; n++) {
         const A = P[n], B = P[(n + 1) % P.length];
         const dx = B[0] - A[0], dz = B[1] - A[1];
-        if (!(dx < -1e-9 && Math.abs(dz) < CUT.roofMin * -dx - 1e-9)) continue;
+        if (!(dx < -1e-9 && Math.abs(dz) < roofMin * -dx - 1e-9)) continue;
         if (Math.abs(dz) < 0.25 * -dx) {
           // a near-level roof: peak it in the middle, a gable rather than a lean-to
           const M = [(A[0] + B[0]) / 2, Math.min(A[1], B[1])];
-          P = clipPoly(P, (v) => M[1] - CUT.roofMin * (v[0] - M[0]) - v[1]);
-          P = clipPoly(P, (v) => M[1] + CUT.roofMin * (v[0] - M[0]) - v[1]);
+          P = clipPoly(P, (v) => M[1] - roofMin * (v[0] - M[0]) - v[1]);
+          P = clipPoly(P, (v) => M[1] + roofMin * (v[0] - M[0]) - v[1]);
         } else {
           const [H, Lo] = A[1] >= B[1] ? [A, B] : [B, A];
           const d = Math.sign(Lo[0] - H[0]);
-          P = clipPoly(P, (v) => H[1] - CUT.roofMin * (v[0] - H[0]) * d - v[1]);
+          P = clipPoly(P, (v) => H[1] - roofMin * (v[0] - H[0]) * d - v[1]);
         }
         break;
       }
     }
-    if (P.length < 3 || polyArea(P) < CUT.minArea || !roofsOk(P, CUT.roofMin)) return null;
+    if (P.length < 3 || polyArea(P) < CUT.minArea || !roofsOk(P, roofMin)) return null;
     // Too thin to be a hole: a sliver clipped along the zone's edge has room
     // lengthwise but none across. 2*area/perimeter is the inradius of a triangle
     // and a fair stand-in for any convex shape's half-thickness.
@@ -218,8 +218,35 @@ function latticeHoles(s, zLo, zHi, sA, sB) {
     if (2 * polyArea(P) / per < CUT.minHalf / 1.5) return null;
     return P;
   };
-  const z0 = Math.min(...zLo.filter((_, i) => s[i] >= sA && s[i] <= sB));
-  const zTop = Math.max(...zHi.filter((_, i) => s[i] >= sA && s[i] <= sB));
+  return fit;
+}
+
+/** Where the zone's holes start and stop: its lowest floor and highest top. */
+function zoneSpan(s, zLo, zHi, sA, sB) {
+  return [Math.min(...zLo.filter((_, i) => s[i] >= sA && s[i] <= sB)),
+          Math.max(...zHi.filter((_, i) => s[i] >= sA && s[i] <= sB))];
+}
+
+/**
+ * LATTICE: diamonds in staggered rows over the whole hole zone, the solid left
+ * between them a truss of diagonal struts. The zone is the wall's REAL outline
+ * (under the top rail, over the foot rail, between the end posts), so on a
+ * triangular fin the lattice runs right up the slope instead of stopping at
+ * the first cell that is short at one end.
+ *
+ * At the edges each diamond is clipped to the zone, and kept if every roof it
+ * ends up with still rises at CUT.roofMin (45deg) -- a slope as steep as that
+ * becomes a hole's roof, so a fin under a 45deg face gets triangles hugging it.
+ * A flatter edge would leave a bridge, so there the diamond is shrunk instead
+ * until it fits whole. Anything smaller than a useful hole is left solid.
+ */
+function latticeHoles(s, zLo, zHi, sA, sB) {
+  const k = CUT.latSlope, p = CUT.latPitch;
+  const inset = CUT.latStrut / 2 / (k / Math.hypot(1, k));   // strut half-width, measured flat
+  const a = p / 2 - inset, b = k * a;
+  if (a < CUT.minHalf) return [];
+  const fit = zoneFit(s, zLo, zHi, sA, sB, CUT.roofMin);
+  const [z0, zTop] = zoneSpan(s, zLo, zHi, sA, sB);
   const cols = Math.ceil((sB - sA) / p) + 1;
   const holes = [];
   for (let j = 0; z0 + j * (k * p / 2) - b <= zTop; j++) {
@@ -229,6 +256,40 @@ function latticeHoles(s, zLo, zHi, sA, sB) {
       if (sm + a < sA || sm - a > sB) continue;
       for (const f of [1, 0.8, 0.62, 0.46, 0.34]) {
         const P = fit([[sm, zc - b * f], [sm + a * f, zc], [sm, zc + b * f], [sm - a * f, zc]]);
+        if (P) { holes.push(P); break; }
+      }
+    }
+  }
+  return holes;
+}
+
+/**
+ * HONEYCOMB: hexagons stood on a corner, in staggered rows, fitted to the zone as
+ * the lattice's diamonds are. Each has vertical sides `h` tall and a pointed roof
+ * and floor rising CUT.hexSlope per unit across; `h` is the roof edge's length, so
+ * at a slope of 1/sqrt(3) it is a regular hexagon and steeper it is one stretched
+ * upright. Neighbours in a row leave a vertical strut CUT.hexStrut wide; the next
+ * row sits in the notches, its floors CUT.hexStrut square to the roofs below.
+ */
+export function honeycombHoles(s, zLo, zHi, sA, sB) {
+  const k = CUT.hexSlope, p = CUT.hexPitch, t = CUT.hexStrut;
+  const a = (p - t) / 2, r = k * a, h = a * Math.hypot(1, k);
+  if (a < CUT.minHalf) return [];
+  // row to row: the floor above runs parallel to the roof below, t apart square to it
+  const dz = h + k * (p / 2 - t) + t * Math.hypot(1, k);
+  const fit = zoneFit(s, zLo, zHi, sA, sB, Math.min(CUT.roofMin, k));
+  const [z0, zTop] = zoneSpan(s, zLo, zHi, sA, sB);
+  const half = h / 2 + r;                              // centre to tip
+  const cols = Math.ceil((sB - sA) / p) + 1;
+  const holes = [];
+  for (let j = 0; z0 + half * 0.5 + j * dz - half <= zTop; j++) {
+    const zc = z0 + half * 0.5 + j * dz;
+    for (let i = -1; i <= cols; i++) {
+      const sm = sA + t / 2 + a + i * p + (j % 2 ? p / 2 : 0);
+      if (sm + a < sA || sm - a > sB) continue;
+      for (const f of [1, 0.8, 0.62, 0.46, 0.34]) {
+        const P = fit([[sm, zc - half * f], [sm + a * f, zc - h / 2 * f], [sm + a * f, zc + h / 2 * f],
+                       [sm, zc + half * f], [sm - a * f, zc + h / 2 * f], [sm - a * f, zc - h / 2 * f]]);
         if (P) { holes.push(P); break; }
       }
     }
@@ -313,7 +374,7 @@ function stripSolid(s0, s1, zb, zt, obst) {
  * Emit `st` (per-station wall data from sweep / sweepBetween) as a wall with
  * CUT.pattern holes, or return false to have the caller emit its solid ribbon.
  * `full` is the caller's solid sections, reused for the end posts; `wall` the
- * wall's own numbers (prop.js PROP: th, tip, minStations).
+ * wall's own numbers (prop/config.js PROP: th, tip, minStations).
  */
 export function cutWall(st, full, out, wall) {
   const kind = CUT.pattern;
@@ -347,7 +408,9 @@ export function cutWall(st, full, out, wall) {
   // the wall is too short for any zone the two meet in the middle.
   const zHi = [], zLo = [];
   for (const q of st) {
-    const hi = q.ztip - CUT.rail, lo = q.botTip + CUT.rail;
+    // under a flat interface crest ztip is the crest's cut; the holes still stop
+    // where the wall's taper began (holeTop), so the crest takes no plastic from them
+    const hi = (q.holeTop ?? q.ztip) - CUT.rail, lo = q.botTip + CUT.rail;
     const m = (hi + lo) / 2;
     zHi.push(hi > lo ? hi : m);
     zLo.push(hi > lo ? lo : m);
@@ -356,6 +419,8 @@ export function cutWall(st, full, out, wall) {
   let holes;
   if (kind === 'lattice') {
     holes = latticeHoles(s, zLo, zHi, sA, sB);
+  } else if (kind === 'honeycomb') {
+    holes = honeycombHoles(s, zLo, zHi, sA, sB);
   } else {
     holes = [];
     for (let c = 0; c + 1 < edges.length; c++) {
@@ -385,15 +450,33 @@ export function cutWall(st, full, out, wall) {
   for (let i = edges[0]; i <= edges[edges.length - 1]; i++) {
     const q = st[i];
     const P = (o, z) => [q.p[0] + q.sx * o, q.p[1] + q.sy * o, z];
-    // keep each band inside the wall's own profile
-    const ct = Math.max(q.botTip, Math.min(zHi[i], q.ztip - 0.01));
-    const cb = Math.min(q.ztip, Math.max(zLo[i], q.botTip + 0.01));
-    top.push([P(+th, ct), P(+th, q.ztip), P(+tp, q.top),
-              P(-tp, q.top), P(-th, q.ztip), P(-th, ct)]);
+    // keep each band inside the wall's own profile. Where the zone has closed up
+    // the bands would meet flush at its middle (issue #223), so they overlap there.
+    const shut = zHi[i] - zLo[i] < 1e-9 ? CUT.eps / 2 : 0;
+    const ct = Math.max(q.botTip, Math.min(zHi[i] - shut, q.ztip - 0.01));
+    const cb = Math.min(q.ztip, Math.max(zLo[i] + shut, q.botTip + 0.01));
+    const tq = q.tipHalf ?? tp;                 // narrower when an interface crest sits on it
+    const w = q.sh ?? th;                       // the station's body: narrower on a low wide wall (044)
+    top.push([P(+w, ct), P(+w, q.ztip), P(+tq, q.top),
+              P(-tq, q.top), P(-w, q.ztip), P(-w, ct)]);
     bot.push(q.taperBot
-      ? [P(+tp, q.bot), P(+th, q.botTip), P(+th, cb), P(-th, cb), P(-th, q.botTip), P(-tp, q.bot)]
-      : [P(+th, q.bot), P(+th, cb), P(-th, cb), P(-th, q.bot)]);
+      ? [P(+tp, q.bot), P(+w, q.botTip), P(+w, cb), P(-w, cb), P(-w, q.botTip), P(-tp, q.bot)]
+      : [P(+w, q.botP ?? q.bot), P(+w, cb), P(-w, cb), P(-w, q.botN ?? q.bot)]);  // a tilted lifted bottom (sweepBetween)
   }
+  // Against an end post a band starts 2 * CUT.eps inside it, on the line of its
+  // first segment (same surface): ending at the post's own cap, it shared the
+  // cap's tip edges -- flush, four faces to an edge (issue #223). Twice eps, past
+  // the strips' own reach into the post (0.4-0.6 eps), so a band corner never
+  // lands on one of theirs.
+  const into = (k, k2) => {
+    const f = 2 * CUT.eps / Math.max(1e-9, Math.abs(s[edges[k]] - s[edges[k] + k2]));
+    for (const band of [top, bot]) {
+      const j = k === 0 ? 0 : band.length - 1, n = j + k2;
+      band[j] = band[j].map((v, m) => v.map((c, d) => c + (c - band[n][m][d]) * f));
+    }
+  };
+  if (top.length > 1 && edges[0] > 0) into(0, 1);
+  if (top.length > 1 && edges[edges.length - 1] < st.length - 1) into(edges.length - 1, -1);
   ribbon(top, out);
   ribbon(bot, out);
   // End posts: the caller's full sections outside the cut span, so the wall's
@@ -425,30 +508,82 @@ export function cutWall(st, full, out, wall) {
     beyond.push([[s[i], zMin - 1], [s[i + 1], zMin - 1], [s[i + 1], zLo[i + 1] - e], [s[i], zLo[i] - e]]);
   }
   const obst = [...holes, ...beyond];
-  const inHole = (u, v) => holes.some((P) => { const m = spanAt(P, v); return m && u > m[0] && u < m[1]; });
+  // A strip's pieces tile it exactly: left as they are they meet FLUSH -- at every
+  // slab cut, across every strip side, corner to corner at a hole's tip -- and
+  // share the edges a slicer welds, four or six faces to an edge, which it reports
+  // as non-manifold (issue #223). So every edge of a piece moves outward by
+  // 0.4-0.6 e, and the piece is the region inside the moved edges -- an
+  // intersection of half-planes, so still convex -- overlapping each neighbour by
+  // about e across every shared boundary. Each piece takes its own distance in
+  // that range (a fixed golden-ratio step, so the build stays deterministic): with
+  // one distance for all, two pieces e apart (a slab e tall is common -- the
+  // zone's edges sit e from the bands) grew into it and met flush in the middle.
+  // A hole within reach stays out: the piece and the hole are disjoint and convex,
+  // so one of their edges separates them, and the grown piece is clipped to that
+  // line (a hole's own edge stays exactly where it was).
+  const side = (A, B, V) => (B[0] - A[0]) * (V[1] - A[1]) - (B[1] - A[1]) * (V[0] - A[0]);
+  // V outside A->B (on its right; holes and pieces are CCW), to within a micron so
+  // shapes that touch along an edge or at a corner count; a lattice hole can
+  // repeat a corner, and a zero-length edge separates nothing
+  const outside = (A, B, V) => {
+    const len = Math.hypot(B[0] - A[0], B[1] - A[1]);
+    return len > 1e-9 && side(A, B, V) <= 1e-6 * len;
+  };
+  let pieces = 0;
+  const grow = (poly) => {
+    const g = e * (0.4 + 0.2 * ((++pieces * 0.6180339887498949) % 1));
+    let lo0 = Infinity, lo1 = Infinity, hi0 = -Infinity, hi1 = -Infinity;
+    for (const [u, v] of poly) { lo0 = Math.min(lo0, u); hi0 = Math.max(hi0, u); lo1 = Math.min(lo1, v); hi1 = Math.max(hi1, v); }
+    // the box a piece may grow into: g past its own extent, no further (a sharp
+    // corner's moved edges would otherwise meet far out)
+    let G = [[lo0 - g, lo1 - g], [hi0 + g, lo1 - g], [hi0 + g, hi1 + g], [lo0 - g, hi1 + g]];
+    const keep = (A, B, d) => {             // the piece's side of A->B's line, moved out by d
+      const len = Math.hypot(B[0] - A[0], B[1] - A[1]);
+      if (len >= 1e-9) G = clipPoly(G, (V) => side(A, B, V) / len + d);
+    };
+    for (let n = 0; n < poly.length; n++) keep(poly[n], poly[(n + 1) % poly.length], g);
+    for (const H of holes) {
+      if (G.length < 3) break;
+      const near = H.some((V, n) => {
+        const W = H[(n + 1) % H.length];
+        return Math.max(V[0], W[0]) >= lo0 - e && Math.min(V[0], W[0]) <= hi0 + e
+            && Math.max(V[1], W[1]) >= lo1 - e && Math.min(V[1], W[1]) <= hi1 + e;
+      });
+      if (!near) continue;
+      // a hole edge with the whole piece outside it, or else a piece edge with the
+      // whole hole outside it (that edge then stays put)
+      let cut = null;
+      for (let n = 0; n < H.length && !cut; n++) {
+        const A = H[n], B = H[(n + 1) % H.length];
+        if (poly.every((V) => outside(A, B, V))) cut = [B, A];
+      }
+      for (let n = 0; n < poly.length && !cut; n++) {
+        const A = poly[n], B = poly[(n + 1) % poly.length];
+        if (H.every((V) => outside(A, B, V))) cut = [A, B];
+      }
+      // nothing separates them only if the piece already overlaps the hole: then
+      // it doesn't grow at all, rather than grow further in
+      if (!cut) return poly;
+      keep(cut[0], cut[1], 0);
+    }
+    return G;
+  };
   const P = (u, v, o) => { const f = at(u); return [f.x + f.sx * o, f.y + f.sy * o, v]; };
   for (let c = 0; c + 1 < edges.length; c++) {
     const s0 = s[edges[c]], s1 = s[edges[c + 1]];
     let zb = Infinity, zt = -Infinity;
-    for (let i = edges[c]; i <= edges[c + 1]; i++) { zb = Math.min(zb, zLo[i] - e); zt = Math.max(zt, zHi[i] + e); }
+    let sw = th;   // a strip no wider than the narrowest body it spans (044)
+    for (let i = edges[c]; i <= edges[c + 1]; i++) {
+      zb = Math.min(zb, zLo[i] - e); zt = Math.max(zt, zHi[i] + e); sw = Math.min(sw, st[i].sh ?? th);
+    }
     for (const poly of stripSolid(s0, s1, zb, zt, obst)) {
-      // grow the piece by eps across the strip's sides so it overlaps the posts /
-      // next strip -- but never into a hole that straddles the side (the lattice's
-      // do), which would hang a hair-thin lip into it
-      // A corner on the side is slid ALONG its inward edge (not straight across),
-      // so a slanted hole edge stays exactly where it is -- sliding it across
-      // would tilt that edge and shave a sliver off the solid next to the hole.
-      const grown = poly.map((V, n) => {
-        const [u, v] = V;
-        if (u !== s0 && u !== s1) return V;
-        const nb = [poly[(n + poly.length - 1) % poly.length], poly[(n + 1) % poly.length]]
-          .filter((W) => W[0] !== u);
-        if (nb.length !== 1) return V;             // a tip touching the side: leave it
-        const [W] = nb, k = e / Math.abs(W[0] - u);
-        const G = [u + (u - W[0]) * k, v + (v - W[1]) * k];
-        return inHole(G[0], G[1]) ? V : G;
+      // corners closer than 0.1 micron are one corner to a slicer, which welds
+      // them: left twice, the extrusion has zero-area faces
+      const g = grow(poly).filter((V, n, G) => {
+        const U = G[(n + 1) % G.length];
+        return Math.abs(U[0] - V[0]) > 1e-4 || Math.abs(U[1] - V[1]) > 1e-4;
       });
-      boxExtrude(grown, -th, th, P, out);
+      if (g.length >= 3) boxExtrude(g, -sw, sw, P, out);
     }
   }
   return true;

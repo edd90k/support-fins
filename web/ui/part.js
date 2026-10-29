@@ -1,0 +1,524 @@
+import { t, tn } from './i18n.js';
+/**
+ * The part: loading a mesh onto the plate (setPart), re-analysing and shading it
+ * in its current pose (shade), the stats panel, the build-volume fit check, and
+ * the overhang threshold. Owns part / topology / rotM3 / lastResult.
+ */
+import * as THREE from 'three';
+import { buildTopology, analyze, DEFAULT_THRESHOLD, MIN_REGION_AREA } from '../overhangs.js';
+import { el } from './dom.js';
+import { scene, controls, frame, clip, MODEL, requestRender } from './scene.js';
+import { setSection, followPart } from './section.js';
+import { showToolbar } from './toolbar.js';
+import { removeMode, cancelRemove, resetRemovals } from './remove.js';
+import { resetHistory } from './history.js';
+import { importNote, renderImportNote, forgetImport } from './io.js';
+import { currentVolume } from './volume.js';
+import { resetLoad, updateLayerView, hideLayerView, updateLoadReadout, syncLoadUI } from './strength.js';
+import { hideSuggestions } from './suggest.js';
+import {
+  setDrawnWalls, setDrawMsg, markPrintTrisDirty, clearPreview, syncDrawControls,
+} from './walls.js';
+import { activeAdded, refreshFins, markFinsStale } from './finbuild.js';
+import { finsVisible, highlightSmall, setDrawAugment, syncAugmentUI } from './settings.js';
+import { gizmo, hoverFace, setGizmo, setLayPlacing } from './pose.js';
+import { resetScale } from './scale.js';
+import { updateIslands, renderIslandText, hadIslands } from './islands.js';
+import { liveXY, parkedOff } from './models.js';
+import { checkOverlap, overlapping } from './arrange.js';
+
+const partMaterial = new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.62, metalness: 0.05,
+  vertexColors: true, side: THREE.DoubleSide, clippingPlanes: clip,
+});
+// With a section cut, the back faces you see are the inside of the material the
+// plane went through: paint them one flat, unlit slate so the cut reads as solid
+// (a darkened lit shade read as just another face) and the inside surfaces --
+// red where they overhang -- stand out against it. Only compiled in while a cut
+// is on: three.js rebuilds the program when the clipping plane count changes.
+partMaterial.onBeforeCompile = (sh) => {
+  sh.fragmentShader = sh.fragmentShader.replace('#include <opaque_fragment>',
+    '#include <opaque_fragment>\n#if NUM_CLIPPING_PLANES > 0\n'
+    + 'if (!gl_FrontFacing) gl_FragColor.rgb = vec3(0.09, 0.10, 0.13);\n#endif');
+};
+export let part = null;
+export let partName = '';
+export let topology = null;      // welded adjacency, rebuilt only when the mesh changes
+let weldMs = 0;
+export let analysisTiming = '';
+let lastSize = null;
+
+const SHADE = {
+  plain: new THREE.Color().setHex(0xb9c2d0, THREE.SRGBColorSpace),
+  over: new THREE.Color().setHex(0xff5a4d, THREE.SRGBColorSpace),
+  // An area-based sliver, or after generation an exempt small-hole ceiling:
+  // it prints unsupported, so it must still show in amber.
+  small: new THREE.Color().setHex(0xffb454, THREE.SRGBColorSpace),
+  bed: new THREE.Color().setHex(0x3f7fd0, THREE.SRGBColorSpace),
+};
+// paintOverhangs' record of what each face shows, as an index into SHADES
+const SHADES = [null, SHADE.plain, SHADE.over, SHADE.small, SHADE.bed];
+let painted = null, paintedAttr = null;
+let smallHoleHighlight = null;
+
+/** Install only a completed build's classification for the analysis it used. */
+export function setSmallHoleHighlight(built, result = lastResult) {
+  smallHoleHighlight = built?.smallHoleMask && result === lastResult
+    ? { result, mask: built.smallHoleMask, count: built.smallHoleRegions } : null;
+  paintOverhangs();
+}
+
+/**
+ * Drop `geometry` onto the plate: centred in XY, its lowest point resting on
+ * z=0. Returns the measured size so the caller can report it. `quat` (a rescale,
+ * ui/scale.js) keeps the pose; a new file starts unturned, at 100 %.
+ */
+export function setPart(geometry, filename, { quat } = {}) {
+  if (part) {
+    part.geometry.dispose();
+    scene.remove(part);
+  }
+  geometry.computeBoundingBox();
+  const bb = geometry.boundingBox;
+  // Centre the geometry on its own origin in ALL THREE axes, so the part rotates
+  // about its middle and the gizmo sits there rather than at its feet. Seating on
+  // the plate is not this transform's job -- analyze() returns the offset for that
+  // after the rotation is known.
+  const centre = [(bb.min.x + bb.max.x) / 2, (bb.min.y + bb.max.y) / 2, (bb.min.z + bb.max.z) / 2];
+  geometry.translate(-centre[0], -centre[1], -centre[2]);
+  // the file's frame, for what the export carries in it (the slicer's parts, #104)
+  geometry.userData.centre = centre;
+  // Always recompute shading normals from the winding -- never trust the STL's
+  // stored normals. A binary STL carries a per-face normal that STLLoader loads
+  // into a `normal` attribute, and exporters routinely write those as zero or
+  // garbage (the same reason buildTopology derives its own). A zero normal lights
+  // as pure black, so trusting the stored one renders the whole part invisible.
+  // Dropping the attribute first forces computeVertexNormals to rebuild it.
+  geometry.deleteAttribute('normal');
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+
+  part = new THREE.Mesh(geometry, partMaterial);
+  part.layers.enable(MODEL);
+  part.add(hoverFace);
+  hoverFace.visible = false;
+  scene.add(part);
+
+  const nFaces = geometry.getAttribute('position').count / 3;
+  geometry.setAttribute(
+    'color', new THREE.Float32BufferAttribute(new Float32Array(nFaces * 9), 3));
+
+  const tWeld = performance.now();
+  topology = buildTopology(geometry);
+  weldMs = performance.now() - tWeld;
+  computeFlatBaseline();
+
+  partName = filename;
+  if (quat) part.quaternion.copy(quat);
+  else part.quaternion.identity();
+  gizmo.attach(part);
+  showToolbar(true);
+
+  resetPartState();
+
+  const size = shade();
+  frame(size);
+  resetScale();
+  document.dispatchEvent(new Event('partchange'));   // the plate tabs (ui/plates.js)
+  return size;
+}
+
+/**
+ * What a part's tools hold that means nothing on another part (or on none): the
+ * drawn walls, removed fins, armed modes, load arrow, Suggest list, section cut and
+ * undo history. Shared by setPart and clearPart.
+ */
+function resetPartState() {
+  // A new part (or none) starts with no hand-drawn walls and a fresh print-space cache.
+  setDrawnWalls([]);
+  // Per-fin removals are keyed by a content signature that can coincidentally
+  // match a different model's fins, so they must NOT carry across parts -- clear
+  // them here alongside the walls, or loading a new STL silently drops fins.
+  resetRemovals();
+  // Nor does an armed remove mode: it hides the rotate rings and turns every click
+  // on the new part into a fin pick, so the part looked stuck until Esc.
+  if (removeMode) cancelRemove();
+  setDrawAugment(false);
+  setDrawMsg('');
+  markPrintTrisDirty();
+  clearPreview();
+  syncAugmentUI();       // "+ Add" is off now: the button and the Draw hint say so
+  syncDrawControls();
+  // A new part (or none) starts with no load direction either, and no Suggest ranking: the
+  // list and verdict were the OLD part's poses.
+  resetLoad();
+  hideSuggestions();
+  setLayPlacing(false);
+  setSection(false);     // the old part's cut means nothing on the new one
+  controls.enabled = true;
+  syncLoadUI();
+  setGizmo();
+
+  // Undo history does not carry across parts.
+  resetHistory();
+}
+
+/**
+ * Take the part off the plate (the stats card's Remove model): back to the empty
+ * page a fresh tab shows, so the next model needs no reload. The fin settings stay,
+ * as they do across a load.
+ */
+export function clearPart() {
+  stashPart()?.mesh.geometry.dispose();
+}
+
+/**
+ * Take the part off the screen WITHOUT disposing it, for another plate (ui/plates.js):
+ * the mesh keeps its geometry and pose, the topology its weld, so coming back costs
+ * no reload. The page is left as clearPart leaves it. Null when there is no part.
+ */
+export function stashPart() {
+  if (!part) return null;
+  const rec = { mesh: part, topology, name: partName, weldMs };
+  gizmo.detach();
+  part.remove(hoverFace);
+  hoverFace.visible = false;
+  scene.remove(part);
+  part = null;
+  topology = null;
+  lastResult = lastShadeRes = null;
+  smallHoleHighlight = null;
+  flatRegions = null;
+  painted = paintedAttr = null;
+  lastSize = null;
+  partName = '';
+  resetPartState();
+  refreshFins();           // no lastResult now: drops the fins, pad and readout
+  updateIslands(null, null, null, new THREE.Vector3(), false);   // and the midair cones
+  resetScale();
+  forgetImport();
+  hideLayerView();
+  showToolbar(false);
+  el('stats').hidden = true;
+  el('status').hidden = true;
+  el('drop').classList.remove('hidden');
+  // the whole bare plate in view, not the spot the part sat on
+  const v = currentVolume();
+  frame(new THREE.Vector3(v.x * 0.7, v.y * 0.7, 0));
+  requestRender();
+  document.dispatchEvent(new Event('partchange'));   // the plate tabs (ui/plates.js)
+  return rec;
+}
+
+/**
+ * Put a stashed part (stashPart) back on the screen, as setPart would a new one but
+ * with no re-weld: it comes back in the pose it left in, with nothing drawn on it
+ * -- ui/plates.js restores its walls, settings and history after.
+ */
+export function unstashPart(rec) {
+  if (part) clearPart();
+  part = rec.mesh;
+  part.material = partMaterial;     // parked, it wore the row's dimmed look
+  topology = rec.topology;
+  partName = rec.name;
+  weldMs = rec.weldMs;
+  part.add(hoverFace);
+  hoverFace.visible = false;
+  scene.add(part);
+  computeFlatBaseline();
+  gizmo.attach(part);
+  showToolbar(true);
+  resetPartState();
+  resetScale();
+  const size = shade();
+  frame(size);
+  document.dispatchEvent(new Event('partchange'));   // the plate tabs (ui/plates.js)
+  return size;
+}
+
+/**
+ * Re-run the overhang analysis in the part's CURRENT orientation, re-seat it on
+ * the plate, and paint the result. Cheap enough to call on every frame of a
+ * gizmo drag -- the expensive weld already happened in setPart(), and rotation
+ * cannot invalidate it.
+ */
+export const rotM3 = new THREE.Matrix3();
+const rotM4 = new THREE.Matrix4();
+
+// Overhangs in the AS-LOADED (identity) orientation. For an exported STL that is
+// almost always the flat print pose, so it answers the question the leaf raised:
+// does this part even need the tool? A part that prints flat with no overhangs
+// gets none here, and every overhang the user then sees is one they created by
+// rotating. Depends only on topology + threshold, never on rotation, so it is
+// cached -- recomputed on load and on a threshold change, not per drag frame.
+const IDENTITY3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+let flatRegions = null;
+function computeFlatBaseline() {
+  flatRegions = topology ? analyze(topology, threshold, IDENTITY3).regions.length : null;
+}
+
+/**
+ * Face colours, the Overhangs readout line and the over-warn card for `res`.
+ * Split from shade() so the Display toggle can repaint without re-analysing
+ * (and without rebuilding the fins, which shade() also does).
+ */
+export function paintOverhangs(res = lastResult) {
+  if (!part || !topology || !res) return;
+  const holes = smallHoleHighlight?.result === res ? smallHoleHighlight : null;
+  const colors = part.geometry.getAttribute('color');
+  const arr = colors.array;
+  // Write only the faces whose colour changed since the last paint, and upload
+  // only the span they fall in. A turn moves a band of faces between colours; on
+  // a 1.56M-face part, rewriting and re-uploading all 56 MB of colour every drag
+  // frame was a fixed cost on top of the analysis.
+  const n = topology.nFaces;
+  if (!painted || paintedAttr !== colors || painted.length !== n) {
+    painted = new Uint8Array(n);       // 0 = never painted: every face is written
+    paintedAttr = colors;
+  }
+  let lo = n, hi = -1;
+  for (let f = 0; f < n; f++) {
+    const k = holes?.mask[f] ? (highlightSmall ? 3 : 1)
+      : res.kept[f] ? 2 : res.over[f] && highlightSmall ? 3 : res.onBed[f] ? 4 : 1;
+    if (painted[f] === k) continue;
+    painted[f] = k;
+    if (f < lo) lo = f;
+    hi = f;
+    const c = SHADES[k];
+    for (let i = 0; i < 3; i++) {
+      const o = f * 9 + i * 3;
+      arr[o] = c.r; arr[o + 1] = c.g; arr[o + 2] = c.b;
+    }
+  }
+  if (hi >= lo) {
+    colors.clearUpdateRanges();
+    colors.addUpdateRange(lo * 9, (hi - lo + 1) * 9);
+    colors.needsUpdate = true;
+  }
+
+  lastShadeRes = res;
+  const dropped = res.rawRegionCount - res.regions.length;
+  // The slivers keep their own amber swatch, so the amber faces have a name even
+  // when this pose has no region the tool supports.
+  const sOver = el('s-over');
+  const regCount = res.regions.length;
+  if (regCount === 0) {
+    sOver.textContent = t('none');
+  } else {
+    sOver.textContent = tn('{n} region', '{n} regions', regCount);
+  }
+  if (dropped) {
+    const sw = document.createElement('i');
+    sw.className = 'sw sw-small';
+    sw.title = t('Amber: overhangs under {area} mm², too small for a fin', { area: MIN_REGION_AREA });
+    sOver.append(' (+', sw, `${tn('{n} sliver', '{n} slivers', dropped)})`);
+  }
+  if (holes?.count) {
+    const sw = document.createElement('i');
+    sw.className = 'sw sw-small';
+    sw.title = t('Amber after generation: small-hole ceilings left for bridging');
+    sOver.append(' (', sw, tn('{n} small hole left for bridging', '{n} small holes left for bridging', holes.count), ')');
+  }
+  sOver.classList.toggle('good', res.regions.length === 0 && !dropped);
+  renderIslandText();
+
+  // Overhang warning (bottom-right card). The tool builds support for the big
+  // overhang REGIONS but drops the small ones -- hole ceilings, slot roofs, a
+  // slotted peg's underside -- as slivers. Those are exactly what prints rough by
+  // surprise, so they shade amber and this card says what amber means, whenever
+  // there are any (a clean pose too: the amber faces still need a name).
+  // Settings > Display > "Highlight small overhangs" off hides the shading and this
+  // card; the sliver count in the readout above stays.
+  const warn = el('over-warn');
+  if (dropped > 0 && highlightSmall) {
+    warn.textContent = tn(
+      '⚠ {n} overhang shaded amber is too small for a fin (under {area} mm² each), so it prints unsupported this way up and may come out rough. Try Suggest orientation to point it up.',
+      '⚠ {n} overhangs shaded amber are too small for a fin (under {area} mm² each), so they print unsupported this way up and may come out rough. Try Suggest orientation to point them up.',
+      dropped, { area: MIN_REGION_AREA });
+  } else {
+    warn.textContent = '';
+  }
+}
+
+export function shade() {
+  if (!part || !topology) return new THREE.Vector3();
+  smallHoleHighlight = null;  // a new pose/threshold needs its own completed build
+  rotM3.setFromMatrix4(rotM4.makeRotationFromQuaternion(part.quaternion));
+
+  const t0 = performance.now();
+  const res = analyze(topology, threshold, rotM3.elements);
+  const ms = performance.now() - t0;
+
+  // Drop the rotated part back onto the plate, centred over it -- but NOT mid-drag.
+  // The rotate gizmo turns the part about part.position, so re-seating it every
+  // frame slides the pivot out from under the pointer and the ring reads as jumpy /
+  // jittery. While a drag is live we hold the pre-drag seat and let the part swing
+  // about that fixed point; the drag-end handler re-seats once, on release. The
+  // face SHADING below still updates live either way, so the diagnosis never stalls.
+  if (!gizmo.dragging) part.position.set(res.offset.x, res.offset.y, res.offset.z);
+
+  const size = new THREE.Vector3(res.size.x, res.size.y, res.size.z);
+  report(partName, size);
+
+  const isl = updateIslands(topology, res, rotM3.elements, res.size, gizmo.dragging);
+  paintOverhangs(res);
+  const dropped = res.rawRegionCount - res.regions.length;
+  el('s-overarea').textContent = `${res.overArea.toFixed(0)} mm²`;
+  el('s-bed').textContent = `${res.bedArea.toFixed(0)} mm²`;
+  el('s-bed').classList.toggle('warn', res.bedArea < 1);
+
+  // "Do you even need me?" -- fire the honest signal before the user turns fins
+  // on. Current pose clean wins outright; otherwise, if the part printed flat as
+  // loaded, the overhangs on screen are self-inflicted by rotating.
+  const flat = el('s-flat-note');
+  if (res.regions.length === 0 && (isl.length || (gizmo.dragging && hadIslands()))) {
+    // no red, but a start in midair: not "no supports needed" (the card says why)
+    flat.textContent = '';
+  } else if (res.regions.length === 0) {
+    flat.textContent = dropped ? t('Nothing big enough for a fin this way up.') : t('No supports needed this way up.');
+    flat.className = 'note good';
+  } else if (flatRegions === 0) {
+    flat.textContent = t('This prints clean lying flat. You only need fins if you’re tilting it for strength.');
+    flat.className = 'note';
+  } else {
+    flat.textContent = '';
+  }
+  // Kept as a value rather than read back off the element: the fin readout
+  // appends to this line, and the mode / bed-pad / toggle handlers call
+  // refreshFins() WITHOUT going through shade(), so appending in place stacked
+  // up "· fins 3 ms · fins 3 ms · fins 3 ms" with every toggle.
+  analysisTiming = `${ms.toFixed(0)} ms · ${t('weld')} ${weldMs.toFixed(0)} ms`;
+  el('s-time').textContent = analysisTiming;
+
+  lastResult = res;
+  markPrintTrisDirty();       // orientation moved: the cached print-space part is stale
+  if (finsVisible && !gizmo.dragging) refreshFins();
+  else if (finsVisible) markFinsStale();
+
+  // where the part currently sits, the way a slicer states it
+  const [ex, ey, ez] = readableEuler(part.quaternion);
+  el('rot-now').textContent = `X ${ex}° · Y ${ey}° · Z ${ez}°`;
+  // both strength views are pose-dependent, so refresh them whenever the part turns:
+  // the automatic layer view (always), and the optional load-arrow verdict (if set)
+  updateLayerView(size);
+  updateLoadReadout();
+  syncLoadUI();            // re-light the pad button for the load's new world direction
+  followPart();            // a section cut turns and reseats with the part
+  return size;
+}
+
+const wrap180 = (deg) => {
+  const v = ((deg + 180) % 360 + 360) % 360 - 180;
+  if (Object.is(v, -0)) return 0;
+  return v === -180 ? 180 : v;      // half a turn reads better as +180
+};
+
+/**
+ * Euler angles for display, in whichever of the two equivalent solutions reads
+ * better. Every orientation has two XYZ triples, and the one three.js hands back
+ * is often the ugly one: turning a part 90 degrees about Y twice reports
+ * "X -180, Y 0, Z -180" rather than "Y 180". Same rotation, but a user reading it
+ * cannot tell what they did.
+ *
+ * The alternate solution is verified against the original quaternion rather than
+ * trusted, so a convention change in three.js degrades to the plain answer
+ * instead of silently displaying a wrong one.
+ */
+const _e = new THREE.Euler();
+const _q = new THREE.Quaternion();
+
+function readableEuler(q) {
+  _e.setFromQuaternion(q, 'XYZ');
+  const a = [_e.x, _e.y, _e.z].map((r) => wrap180(THREE.MathUtils.radToDeg(r)));
+  const b = [wrap180(a[0] + 180), wrap180(180 - a[1]), wrap180(a[2] + 180)];
+
+  const cost = (v) => Math.abs(v[0]) + Math.abs(v[1]) + Math.abs(v[2]);
+  if (cost(b) < cost(a)) {
+    _e.set(...b.map(THREE.MathUtils.degToRad), 'XYZ');
+    _q.setFromEuler(_e);
+    if (Math.abs(Math.abs(_q.dot(q)) - 1) < 1e-6) return b.map(Math.round);
+  }
+  return a.map(Math.round);
+}
+
+// -------------------------------------------------------------------- reports
+
+function report(filename, size) {
+  el('s-name').textContent = filename;
+  el('s-tris').textContent = (topology?.nFaces ?? 0).toLocaleString();
+  el('s-bbox').textContent =
+    `${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} mm`;
+
+  lastSize = size;
+  updateFit();
+
+  // Empty string hides it: `.note:empty { display: none }`, same as the sibling notes.
+  el('s-import-note').textContent = importNote;
+
+  el('stats').hidden = false;
+  el('status').hidden = false;
+  el('drop').classList.add('hidden');
+  el('drop').classList.add('compact');   // from now on an empty plate shows no intro
+}
+
+/**
+ * Does it fit the build volume -- including everything the tool ADDS?
+ *
+ * Checking the part alone understates it. The pad spreads `padMargin` past the
+ * part's contact and the fin's base another `basePad` past the wall, so a part
+ * that fits on its own can still put its bed pad over the edge of the plate. The
+ * export bakes those in, so the answer has to account for them.
+ */
+export function updateFit() {
+  if (!lastSize) return;
+  const v = currentVolume();
+  // the part is centred on its spot (analyze seats it so), the fins wherever they reach
+  let x0 = -lastSize.x / 2, x1 = lastSize.x / 2, y0 = -lastSize.y / 2, y1 = lastSize.y / 2, z1 = lastSize.z;
+  const added = activeAdded();
+  for (const p of added) {
+    if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0];
+    if (p[1] < y0) y0 = p[1]; if (p[1] > y1) y1 = p[1];
+    if (p[2] > z1) z1 = p[2];
+  }
+  const big = x1 - x0 > v.x || y1 - y0 > v.y || z1 > v.z;
+  // where it stands on the plate (ui/move.js): a model that would fit can hang off,
+  // and so can a parked one dragged there
+  const [mx, my] = liveXY(), e = 1e-6;
+  const off = !big && (x0 + mx < -v.x / 2 - e || x1 + mx > v.x / 2 + e || y0 + my < -v.y / 2 - e
+    || y1 + my > v.y / 2 + e || parkedOff());
+  // not per frame of a turn on the rings: a big part's cells take tens of ms, and
+  // the release shades (and checks) again
+  if (!gizmo.dragging) checkOverlap();
+  const clash = overlapping();
+  const fit = el('s-fit');
+  fit.textContent = big
+    ? t(added.length ? 'does not fit (with fins)' : 'does not fit')
+    : off && clash ? `${t('models overlap')} · ${t('hangs off the bed')}`
+      : off ? t('hangs off the bed') : clash ? t('models overlap') : t('fits');
+  fit.classList.toggle('warn', big || off || clash);
+}
+
+export let lastResult = null;
+export let threshold = DEFAULT_THRESHOLD;
+const thrInput = el('thr');
+thrInput.value = String(threshold);
+thrInput.addEventListener('input', () => {
+  threshold = Number(thrInput.value);
+  el('thr-val').textContent = `${threshold}°`;
+  computeFlatBaseline();   // the flat baseline moves with the overhang threshold
+  shade();
+});
+
+let lastShadeRes = null;
+
+export function syncPartLanguage() {
+  updateFit();
+  if (typeof renderImportNote === 'function') {
+    const note = renderImportNote();
+    if (note) el('s-import-note').textContent = note;
+  }
+  if (!lastShadeRes) return;
+  paintOverhangs(lastShadeRes);
+}
+
+window.addEventListener('languagechange', syncPartLanguage);

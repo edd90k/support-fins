@@ -1,3 +1,4 @@
+import { t } from './i18n.js';
 /**
  * Strength: the load arrow (a direction the part is pulled in use), its verdict
  * and the "turn to the strongest printable pose" button, plus the layer-line view.
@@ -5,10 +6,12 @@
 import * as THREE from 'three';
 import { loadAlignment, suggestStrengthPose } from '../orient.js';
 import { el } from './dom.js';
+import { addBadge } from './toolbar.js';
 import { scene } from './scene.js';
 import { histPush } from './history.js';
 import { applySuggestion } from './suggest.js';
-import { part, topology, threshold, setGizmo } from '../app.js';
+import { setGizmo } from './pose.js';
+import { part, topology, threshold } from './part.js';
 
 // ------------------------------------------------------------------- load arrow
 //
@@ -28,6 +31,9 @@ export let loadDir = null;         // THREE.Vector3 unit direction in local spac
 /** Undo/redo put this back directly (setLoadDir below is the user action, with
  *  its own undo step). */
 export function replaceLoadDir(v) { loadDir = v; }
+// Its badge in the view toolbar (toolbar.js): lit while a load is set, so a folded
+// popover still says the arrow is on.
+const syncBadge = addBadge('strength-badge', { pop: 'strength-pop', isOn: () => !!loadDir });
 const loadArrowHelper = new THREE.ArrowHelper(
   new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 10, 0xffb454, 4, 2.6);
 loadArrowHelper.visible = false;
@@ -102,6 +108,11 @@ export function updateLayerView(size) {
   layerViz.visible = layersOn && !!part;
 }
 
+/** No part on the plate: no layer frames either. */
+export function hideLayerView() {
+  layerViz.visible = false;
+}
+
 // ---------------------------------------------------------------- load arrow UI
 
 /**
@@ -152,7 +163,8 @@ export function updateLoadReadout() {
   const w = loadDir.clone().applyQuaternion(part.quaternion);
   const al = loadAlignment([w.x, w.y, w.z]);
   if (!al) { note.hidden = true; suggestBtn.hidden = true; return; }
-  note.textContent = al.text;
+  note.textContent = t(al.text);
+  delete note.dataset.strongest;
   note.className = `load-verdict ${al.quality}`;
   note.hidden = false;
   // Offer a stronger pose only when this one isn't already good. Wired in the
@@ -205,6 +217,7 @@ export function syncLoadUI() {
     el(`load-${key}`).classList.toggle('active', key === activeKey);
   }
   el('load-clear').hidden = !has;
+  syncBadge();
 }
 
 // --------------------------------------------------------------- load arrow
@@ -225,6 +238,8 @@ el('load-clear').addEventListener('click', clearLoad);
 // lays the load most in-plane, but only among poses that actually sit on the bed,
 // so it can't produce the needle-tower. If the current pose is already about as
 // good as it gets, say so instead of turning to an equivalent orientation.
+const STRONGEST_NOTE = 'This is about the strongest printable orientation for this '
+  + 'load — a better-aligned pose wouldn’t sit on the bed.';
 el('load-suggest').addEventListener('click', () => {
   if (!part || !topology || !loadDir) return;
   const pose = suggestStrengthPose(topology, [loadDir.x, loadDir.y, loadDir.z], { threshold });
@@ -232,12 +247,20 @@ el('load-suggest').addEventListener('click', () => {
   const cur = loadAlignment([w.x, w.y, w.z]);
   const note = el('load-note');
   if (!pose || (cur && pose.cross >= cur.cross - 0.05)) {
-    note.textContent = 'This is about the strongest printable orientation for this '
-      + 'load — a better-aligned pose wouldn’t sit on the bed.';
+    note.textContent = t(STRONGEST_NOTE);
+    note.dataset.strongest = '1';
     note.className = `load-verdict ${cur ? cur.quality : 'mixed'}`;
     note.hidden = false;
     el('load-suggest').hidden = true;
     return;
   }
   applySuggestion(pose.rot);   // turns the part; shade() refreshes the verdict + button
+});
+
+// Re-word the load note in the new language: the "already strongest" note stays
+// up if that's what it shows, otherwise the verdict for the current pose.
+window.addEventListener('languagechange', () => {
+  const note = el('load-note');
+  if (note.dataset.strongest && !note.hidden) note.textContent = t(STRONGEST_NOTE);
+  else updateLoadReadout();
 });

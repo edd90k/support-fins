@@ -26,16 +26,27 @@
  * tines are horizontal and exactly one layer tall, the geometry is plain closed
  * solids unioned by the slicer, and a rib that can't be built says why.
  *
- * Gap and bite arrive in `opts` rather than being read from FIN/PROP, so this
+ * The gap arrives in `opts` rather than being read from FIN/PROP, so this
  * module depends on neither: the caller passes the material's numbers, whether it
  * runs in the Worker (after fins.js applyTunables) or on the page (Draw).
  */
-import { findWallPatches, patchProbe, patchPoint, tAtZ } from './planes.js';
+import { findWallPatches, patchProbe, patchPoint, tAtZ, zAt, MAX_LEAN_DEG } from './planes.js';
 import { insidePart } from './inside.js';
+import { kissEnds } from './kiss.js';
+import { braceCrossRib, BRACE } from './prop/brace.js';
+import { PROP } from './prop/config.js';
+import { clip, lowestHit } from './swayhit.js';
+import { cropForRib } from './swaycrop.js';
+import { loftExtrude, ribbon, roundedPolygon } from './solids.js';
 
 export const SWAY = {
   // which faces take a brace
   maxLeanDeg: 30,     // a face leaning further than this is an overhang or a roof, not a side
+  // ...unless it faces UP: the back of a leaning arm (GH #351). A brace placed by hand
+  // may anchor that, its inner edge leaning with the face as an overhang of its own,
+  // so up to the most a wall leans and still prints (planes.js MAX_LEAN_DEG, 45).
+  // Auto keeps to maxLeanDeg both ways.
+  maxBackLeanDeg: MAX_LEAN_DEG,
   minFaceH: 30,       // mm of face height before auto-placement bothers bracing it
   minTopFrac: 0.4,    // ...and it must reach this far up the part, or it braces the easy half
   minPartH: 30,       // mm; a shorter part doesn't sway enough to need this
@@ -56,9 +67,14 @@ export const SWAY = {
   footHalf: 3.0,      // flange past the rib on each side
   footPad: 3.0,       // ...and past its outer end
 
-  // the tines (standoff and bite come from the material profile, via opts)
+  // the tines (the standoff comes from the material profile, via opts)
   gap: 0.2,
-  bite: 0.3,
+  // How far in from the face a tine looks for the part: placed only if the part is
+  // there at half this, and its end stops on the surface (kissEnds, searching up to
+  // 2x). Was the material's tine bite (PLA 0.3, PETG 0.15), when tines ran that far
+  // INTO the part; with the end on the surface the reach only gates placement, and
+  // the slicer merges part and brace either way (local issue 027).
+  tineReach: 0.3,
   tineW: 0.5,         // one nozzle bead, as elsewhere
   tineOverlap: 0.3,   // how far the tine sinks back into the rib, so they union
   tineSpanMax: 1.5,   // past this much open air a tine is a bridge (probe_tines2.py)
@@ -91,6 +107,11 @@ export const SWAY = {
 };
 
 const leanCut = () => Math.sin((SWAY.maxLeanDeg * Math.PI) / 180);
+// the same, for a face whose normal points up (+z); the slack is planes.js's, so a
+// face it keeps at exactly 45 degrees isn't refused here by round-off
+const backCut = () => Math.sin((SWAY.maxBackLeanDeg * Math.PI) / 180) + 1e-6;
+/** Can a face with this normal z (in print space) take a brace placed by hand? */
+const takesBrace = (nz) => nz >= -leanCut() && nz <= backCut();
 
 /** Resolve the caller's options against the defaults, clamped to what prints. */
 function settings(opts = {}) {
@@ -99,10 +120,12 @@ function settings(opts = {}) {
     tines: opts.tines !== false,
     layerH: Math.max(0.04, num(opts.layerHeight, 0.2)),
     gap: num(opts.gap, SWAY.gap),
-    bite: num(opts.bite, SWAY.bite),
+    tineContactOffset: Math.max(-0.2, Math.min(0.2, num(opts.tineContactOffset, -0.01))),
     gripFrom: Math.max(0, num(opts.gripFrom, 0)),
     spacing: Math.max(1, num(opts.tineSpacing, SWAY.tineSpacing)),
     reach: Math.max(0.05, Math.min(0.5, num(opts.reach, SWAY.reach))),
+    uncappedDepth: opts.uncappedDepth === true,
+    roundFeet: opts.roundFeet === true && PROP.tineDir !== 'vertical',
     // Auto refuses a brace that would stand a long way up before its first tine;
     // a brace placed BY HAND is built anyway and reports the stilt instead. The
     // tool suggests, the person decides -- the same split as the rest of the app.
@@ -121,21 +144,6 @@ function printTriangles(topo, rot, offset) {
     a[i + 2] = rot[2] * x + rot[5] * y + rot[8] * z + offset.z;
   }
   return a;
-}
-
-/** Sutherland-Hodgman: keep the part of `poly` where `f(v) >= 0`. */
-function clip(poly, f) {
-  const out = [];
-  for (let i = 0; i < poly.length; i++) {
-    const a = poly[i], b = poly[(i + 1) % poly.length];
-    const fa = f(a), fb = f(b);
-    if (fa >= 0) out.push(a);
-    if ((fa >= 0) !== (fb >= 0)) {
-      const t = fa / (fa - fb);
-      out.push(a.map((v, k) => v + (b[k] - v) * t));
-    }
-  }
-  return out;
 }
 
 /** Push a closed solid, flipping the winding outward if its signed volume is negative. */
@@ -177,45 +185,12 @@ function frameOf(p) {
 }
 
 /**
- * The lowest z at which any part triangle crosses the volume the rib would
- * occupy, or Infinity. Exact per triangle: clip to the rib's slab across the
- * face, then against the rib's own (s, z) outline -- the same "does anything
- * cross the volume" question fins.js asks of its walls, for a tapered outline.
- */
-function lowestHit(tris, fr, uLo, uHi, outline) {
-  let best = Infinity;
-  const v = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-  for (let i = 0; i < tris.length; i += 9) {
-    let umin = Infinity, umax = -Infinity;
-    for (let k = 0; k < 3; k++) {
-      const x = tris[i + k * 3], y = tris[i + k * 3 + 1], z = tris[i + k * 3 + 2];
-      v[k][0] = x * fr.nh.x + y * fr.nh.y;
-      v[k][1] = x * fr.uDir.x + y * fr.uDir.y;
-      v[k][2] = z;
-      if (v[k][1] < umin) umin = v[k][1];
-      if (v[k][1] > umax) umax = v[k][1];
-    }
-    if (umax < uLo || umin > uHi) continue;
-    let poly = v.map((q) => q.slice());
-    poly = clip(poly, (q) => q[1] - uLo);
-    poly = clip(poly, (q) => uHi - q[1]);
-    for (const f of outline) {
-      if (poly.length < 2) break;
-      poly = clip(poly, f);
-    }
-    if (poly.length < 2) continue;
-    for (const q of poly) if (q[2] < best) best = q[2];
-  }
-  return best;
-}
-
-/**
  * Build one sway brace against patch `p`, centred across the face at `uc`.
  * Returns { ok: true, tris, tines, height, depth, th, foot } or { ok: false, reason }.
  */
 export function buildSwayRib(p, uc, partTris, topo, rot, offset, opts = {}) {
   const S = settings(opts);
-  if (Math.abs(p.n.z) > leanCut()) {
+  if (!takesBrace(p.n.z)) {
     return { ok: false, reason: 'that face leans too far to stand a brace against — pick an upright side' };
   }
   const fr = { ...frameOf(p), uDir: { x: p.u.x, y: p.u.y } };
@@ -234,14 +209,18 @@ export function buildSwayRib(p, uc, partTris, topo, rot, offset, opts = {}) {
   if (H < SWAY.minRibH) {
     return { ok: false, reason: `that face only reaches ${fz1.toFixed(0)}mm up — too short to need a brace` };
   }
+  if (Number.isFinite(opts.maxHeight)) {
+    H = Math.min(H, opts.maxHeight);
+    if (H < SWAY.minRibH) return { ok: false, reason: 'that’s too low for a brace — move up the side' };
+  }
   const thFor = (h) => Math.min(SWAY.thMax, SWAY.thMin + SWAY.thPerMm * h);
   let th = thFor(H);
 
   // Seat the rib's inner edge on the outermost point of the face INSIDE its own
-  // slab, as fins.js does per window: the patch plane touches the patch's global
-  // high point, which may be elsewhere on the face, and the gap has to be a floor
-  // here, not somewhere else on the same side.
-  const shiftIn = (half) => {
+  // slab, as the old fins.js leaning fin did per window: the patch plane touches
+  // the patch's global high point, which may be elsewhere on the face, and the gap
+  // has to be a floor here, not somewhere else on the same side.
+  const shiftIn = (half, zLo = 0, zHi = H) => {
     let m = -Infinity;
     for (let i = 0; i < p.tris.length; i += 9) {
       let poly = [
@@ -251,6 +230,10 @@ export function buildSwayRib(p, uc, partTris, topo, rot, offset, opts = {}) {
       ];
       poly = clip(poly, (q) => q[0] - (uc - half));
       poly = clip(poly, (q) => (uc + half) - q[0]);
+      if (Number.isFinite(opts.maxHeight)) {
+        poly = clip(poly, (q) => zAt(p, q[2], q[1]) - zLo);
+        poly = clip(poly, (q) => zHi - zAt(p, q[2], q[1]));
+      }
       for (const q of poly) if (q[2] > m) m = q[2];
     }
     return m === -Infinity ? 0 : m;
@@ -259,29 +242,60 @@ export function buildSwayRib(p, uc, partTris, topo, rot, offset, opts = {}) {
   // The outline in (s, z). The inner edge follows the (possibly leaning) face
   // plane at the gap; the outer edge tapers from `D0` at the bed to topDepth.
   let wIn = 0, sIn0 = 0, sInSlope = 0, D0 = 0;
+  let insets = [], heights = [0, H];
   const shape = () => {
     th = thFor(H);
-    wIn = shiftIn(th / 2 + SWAY.tineW) + S.gap;
+    const half = th / 2 + SWAY.tineW;
+    wIn = shiftIn(half) + S.gap;
     const a = fr.sOf(patchPoint(p, wIn, uc, tAtZ(p, wIn, 0)));
     const b = fr.sOf(patchPoint(p, wIn, uc, tAtZ(p, wIn, 1)));
     sIn0 = a; sInSlope = b - a;
-    D0 = Math.max(SWAY.minDepth, Math.min(SWAY.maxDepth, S.reach * H));
+    D0 = Math.max(SWAY.minDepth, S.uncappedDepth ? S.reach * H : Math.min(SWAY.maxDepth, S.reach * H));
+    insets = [];
+    heights = [0, H];
+    if (Number.isFinite(opts.maxHeight)) {
+      const n = Math.ceil(H / 8 - 1e-6);   // a top on a band edge (16 mm) gives 2 bands, not 3 from a round-trip's 1e-15
+      heights = Array.from({ length: n + 1 }, (_, i) => H * i / n);
+      const bands = heights.slice(1).map((z, i) => shiftIn(half, heights[i], z) + S.gap);
+      // Both ends of each segment stay outside that entire band's surface.
+      insets = heights.map((_, i) =>
+        (Math.max(bands[Math.max(0, i - 1)], bands[Math.min(n - 1, i)]) - wIn) / p.h);
+    }
   };
-  const sIn = (z) => sIn0 + sInSlope * z;
+  const sIn = (z) => {
+    const base = sIn0 + sInSlope * z;
+    if (!insets.length) return base;
+    const t = Math.max(0, Math.min(1, z / H)) * (insets.length - 1);
+    const i = Math.min(insets.length - 2, Math.floor(t));
+    return base + insets[i] + (insets[i + 1] - insets[i]) * (t - i);
+  };
   const depthAt = (z) => D0 + (SWAY.topDepth - D0) * Math.min(1, Math.max(0, z / H));
+  const sOut = (z) => sIn0 + sInSlope * z + depthAt(z);
 
   // Shrink the rib until nothing on the part crosses it: a feature sticking out
   // above the face (a ledge, a shoulder) caps it below that feature.
   let hit = Infinity;
   for (let iter = 0; iter < 6; iter++) {
     shape();
-    const outline = [
-      (q) => q[2] + 0.1,
-      (q) => (H + 0.3) - q[2],
-      (q) => q[0] - (sIn(q[2]) - 0.05),
-      (q) => (sIn(q[2]) + depthAt(q[2]) + 0.1) - q[0],
-    ];
-    hit = lowestHit(partTris, fr, uc - th / 2 - 0.3, uc + th / 2 + 0.3, outline);
+    hit = Infinity;
+    for (let i = 0; i < heights.length - 1; i++) {
+      const lo = heights[i], hi = heights[i + 1];
+      const a = sIn(lo), slope = (sIn(hi) - a) / (hi - lo);
+      const outline = [
+        (q) => q[2] - (i === 0 ? -0.1 : lo),
+        (q) => (i === heights.length - 2 ? H + 0.3 : hi) - q[2],
+        (q) => q[0] - (a + slope * (q[2] - lo) - 0.05),
+        (q) => (sOut(q[2]) + 0.1) - q[0],
+      ];
+      // s bounds of this band's outline: its inner edge is a straight line, its outer edge
+      // piecewise linear between the band heights, so the ends and knots are enough.
+      const zA = i === 0 ? -0.1 : lo, zB = i === heights.length - 2 ? H + 0.3 : hi;
+      const inner = (z) => a + slope * (z - lo) - 0.05;
+      let sHi = Math.max(sOut(zA), sOut(zB));
+      for (const z of heights) if (z > zA && z < zB) sHi = Math.max(sHi, sOut(z));
+      hit = Math.min(hit, lowestHit(partTris, fr, uc - th / 2 - 0.3, uc + th / 2 + 0.3, outline,
+                                    Math.min(inner(zA), inner(zB)), sHi + 0.1, zA, zB));
+    }
     if (hit === Infinity) break;
     H = hit - 1.0;
     if (H < SWAY.minRibH) break;
@@ -291,23 +305,31 @@ export function buildSwayRib(p, uc, partTris, topo, rot, offset, opts = {}) {
   }
 
   // The foot has its own, wider footprint on the plate.
-  const sFootOut = sIn(0) + D0 + SWAY.footPad;
+  const sFootOut = sOut(0) + SWAY.footPad;
   const footHalfW = th / 2 + SWAY.footHalf;
   const footHit = lowestHit(partTris, fr, uc - footHalfW - 0.2, uc + footHalfW + 0.2, [
     (q) => q[2] + 0.1,
     (q) => (SWAY.footH + 0.2) - q[2],
     (q) => q[0] - (sIn(0) - 0.05),
     (q) => (sFootOut + 0.1) - q[0],
-  ]);
+  ], sIn(0) - 0.05, sFootOut + 0.1, -0.1, SWAY.footH + 0.2);
   if (footHit !== Infinity) {
     return { ok: false, reason: 'the part’s base spreads out under this face, so there is no room on the plate for the brace’s foot' };
   }
 
   const out = [];
   const P = (s, z, uu) => fr.toWorld(s, uu, z);
-  prism([[sIn(0), 0], [sIn(0) + D0, 0], [sIn(H) + SWAY.topDepth, H], [sIn(H), H]],
-        uc - th / 2, uc + th / 2, P, out);
-  prism([[sIn(0), uc - footHalfW], [sFootOut, uc - footHalfW], [sFootOut, uc + footHalfW], [sIn(0), uc + footHalfW]],
+  if (insets.length) {
+    const local = [];
+    ribbon(heights.map((z) => [P(sIn(z), z, uc - th / 2), P(sOut(z), z, uc - th / 2),
+                              P(sOut(z), z, uc + th / 2), P(sIn(z), z, uc + th / 2)]), local);
+    pushSolid(local, out);
+  } else {
+    prism([[sIn(0), 0], [sOut(0), 0], [sOut(H), H], [sIn(H), H]],
+          uc - th / 2, uc + th / 2, P, out);
+  }
+  const footPoly = [[sIn(0), uc - footHalfW], [sFootOut, uc - footHalfW], [sFootOut, uc + footHalfW], [sIn(0), uc + footHalfW]];
+  prism(S.roundFeet ? roundedPolygon(footPoly, footHalfW) : footPoly,
         0, SWAY.footH, (s, uu, z) => fr.toWorld(s, uu, z), out);
 
   // Tines: evenly spaced up the face, each snapped into exactly one layer cell.
@@ -325,13 +347,31 @@ export function buildSwayRib(p, uc, partTris, topo, rot, offset, opts = {}) {
       const refined = patchProbe(p, uc, tAtZ(p, dev, zMid));
       if (refined !== null) dev = refined;
       const sPart = fr.sOf(patchPoint(p, dev, uc, tAtZ(p, dev, zMid)));
-      const sWall = sIn(zMid);
+      const sWall = insets.length
+        ? Math.max(sIn(bot), sIn(top), ...heights.filter((h) => h > bot && h < top).map(sIn))
+        : sIn(zMid);
       if (sWall - sPart > SWAY.tineSpanMax) continue;      // a bridge, not a tine
-      const bx = fr.toWorld(sPart - S.bite / 2, uc, zMid);
+      const bx = fr.toWorld(sPart - SWAY.tineReach / 2, uc, zMid);
       if (!insidePart(topo, rot, offset, bx[0], bx[1], bx[2])) continue;  // grips nothing
-      prism([[sPart - S.bite, bot], [sWall + SWAY.tineOverlap, bot],
-             [sWall + SWAY.tineOverlap, top], [sPart - S.bite, top]],
-            uc - SWAY.tineW / 2, uc + SWAY.tineW / 2, P, out);
+      // the tine runs from inside the rib to where it meets the part, its end
+      // following the face between bottom and top at the contact offset (kissEnds).
+      // Frame: along = into the part (-s) from the face point, across = z x along.
+      const o = fr.toWorld(sPart, uc, 0), ax = -fr.nh.x, ay = -fr.nh.y;
+      const half = SWAY.tineW / 2;
+      // measured from the face point, not the tine's back: `back` only bounds how far
+      // out of the face the end may pull back (0.25 mm), well short of the rib (ov)
+      const e = kissEnds(topo, rot, offset, o[0], o[1], ax, ay, bot, top,
+                         { half, back: SWAY.tineOverlap, reach: SWAY.tineReach, contactOffset: S.tineContactOffset });
+      const ov = -(sWall + SWAY.tineOverlap - sPart);
+      const PT = (a, b, z) => [o[0] + ax * a - ay * b, o[1] + ay * a + ax * b, z];
+      const outline = (h) => [[ov, -half], [e[h][0], -half], [e[h][1], half], [ov, half]];
+      const local = [];
+      loftExtrude(outline('bot'), outline('top'), bot, top, PT, local);
+      // with Interface material on everywhere, a tine prints in the interface
+      // filament, tagged the way prop/crest.js tags the walls' (a 4th vertex
+      // component, v[3] = 1); not under 'flat', which leaves sideways grip alone
+      if (opts.iface === 'all') for (const v of local) v[3] = 1;
+      pushSolid(local, out);
       tines++;
       if (bot < firstGrip) firstGrip = bot;
     }
@@ -361,14 +401,47 @@ export function buildSwayRib(p, uc, partTris, topo, rot, offset, opts = {}) {
   // The rib's footprint at a ladder of heights, so a clash check can compare two
   // ribs at the SAME z: two ribs on facing walls of a channel reach toward each
   // other, and whether they meet depends on both depths at that height.
-  const levels = [];
+  const levelHeights = new Set(insets.length ? heights : []);
   for (let z = 0; ; z = Math.min(H, z + SWAY.levelStep)) {
-    levels.push({ z, a: fr.toWorld(sIn(z), uc, z), b: fr.toWorld(sIn(z) + depthAt(z), uc, z) });
+    levelHeights.add(z);
     if (z >= H) break;
+  }
+  const levels = [...levelHeights].sort((a, b) => a - b)
+    .map((z) => ({ z, a: fr.toWorld(sIn(z), uc, z), b: fr.toWorld(sOut(z), uc, z) }));
+  // CROSS RIBS ("Brace tall walls"): over the start height the brace is a tall,
+  // thin plate again -- deep toward the face, barely a bead across it -- so it
+  // gets the plate ribs the prop walls get, one each way ALONG the side
+  // (prop/brace.js). They stand on the brace's outer edge, clear of the part by
+  // the brace's whole depth, and taper out to the plate.
+  let cross = 0;
+  const arms = [];
+  if (Number.isFinite(opts.crossAbove) && H > opts.crossAbove) {
+    const inset = th / 2 + 0.1;
+    const o = fr.toWorld(sOut(0) - inset, uc, 0);
+    const slope = sInSlope + (SWAY.topDepth - D0) / H;
+    const lean = [fr.nh.x * slope, fr.nh.y * slope];
+    // ...sheared to follow the outer edge, which leans by the face's lean AND the
+    // taper: a thin plate past 45 degrees sags. An anchor on a steep back (#351) or a
+    // deep brace gets none rather than one that overhangs; skipped, not clamped, since
+    // a rib leaning less than the edge would part from it toward the top.
+    const crossOk = Math.abs(slope) <= 1 + 1e-6;
+    const clearArm = (t) => (opts.crossClear ? opts.crossClear(t) : true);
+    // Only the part near the foot matters to the arms; the square covers the longest reach
+    // plus the clearances and the flange width (see swaycrop.js).
+    const near = crossOk ? cropForRib(partTris, o, Math.max(BRACE.minReach, D0) + 2 * PROP.sideClear + PROP.footMin + th + 1, lean, 0, H + PROP.sideClear) : partTris;
+    for (const sgn of crossOk ? [1, -1] : []) {
+      const d = [p.u.x * sgn, p.u.y * sgn], start = out.length;
+      const c = braceCrossRib(out, near, o, d, 0, H, D0, lean, clearArm, opts.crossRise, th);
+      if (!c) continue;
+      cross++;
+      arms.push({ a: o, b: [o[0] + d[0] * c.reach, o[1] + d[1] * c.reach, 0], th: c.th,
+                  plan: planHull(out.slice(start)) });
+    }
   }
   // `stilt`: how far it stands holding nothing before its first tine. Auto keeps this
   // small by refusing; a hand-placed brace reports it so the readout can say so.
-  return { ok: true, tris: out, tines, height: H, depth: D0, th, stilt, foot, halfW: footHalfW, levels };
+  return { ok: true, tris: out, tines, height: H, depth: D0, th, stilt, foot, halfW: footHalfW, levels,
+           cross, arms, ...(insets.length ? { profiled: true } : {}) };
 }
 
 /** Closest distance between two 2D segments. */
@@ -385,6 +458,49 @@ function segDist(a, b, c, d) {
   return Math.min(pt(a, c, d), pt(b, c, d), pt(c, a, b), pt(d, a, b));
 }
 
+function planHull(points) {
+  const cross = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  const sorted = points.map((p) => [p[0], p[1]]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const pts = sorted.filter((p, i) => !i || p[0] !== sorted[i - 1][0] || p[1] !== sorted[i - 1][1]);
+  if (pts.length < 3) return pts;
+  const half = (list) => {
+    const out = [];
+    for (const p of list) {
+      while (out.length > 1 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop();
+      out.push(p);
+    }
+    out.pop();
+    return out;
+  };
+  return [...half(pts), ...half(pts.slice().reverse())];
+}
+
+function planDist(a, b) {
+  const inside = (p, poly) => poly.length > 2 && poly.every((v, i) => {
+    const w = poly[(i + 1) % poly.length];
+    return (w[0] - v[0]) * (p[1] - v[1]) - (w[1] - v[1]) * (p[0] - v[0]) >= -1e-9;
+  });
+  if (inside(a[0], b) || inside(b[0], a)) return 0;
+  let dist = Infinity;
+  for (let i = 0; i < a.length; i++) for (let j = 0; j < b.length; j++) {
+    dist = Math.min(dist, segDist(a[i], a[(i + 1) % a.length], b[j], b[(j + 1) % b.length]));
+  }
+  return dist;
+}
+
+/** The rectangular footprint of a rib section, without rounded end caps. */
+function stripPlan(a, b, half) {
+  const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const dx = -(b[1] - a[1]) / len, dy = (b[0] - a[0]) / len;
+  return planHull([a, b].flatMap((p) => [[p[0] + dx * half, p[1] + dy * half],
+                                       [p[0] - dx * half, p[1] - dy * half]]));
+}
+
+function bodyPlan(rib) {
+  return planHull([...stripPlan(...rib.foot, rib.halfW),
+    ...rib.levels.flatMap((L) => stripPlan(L.a, L.b, rib.th / 2))]);
+}
+
 /**
  * Would `rib` run into any of `ribs`? Two tests: the FEET on the plate (the widest
  * part, flange included), and the RIBS themselves compared level by level up to
@@ -395,13 +511,24 @@ function segDist(a, b, c, d) {
 export function swayClashes(rib, ribs) {
   for (const r of ribs) {
     if (!r?.foot) continue;
-    if (segDist(rib.foot[0], rib.foot[1], r.foot[0], r.foot[1]) < rib.halfW + r.halfW + SWAY.clearance) return true;
-    const need = (rib.th + r.th) / 2 + SWAY.clearance;
+    // Segment distance plus half-width treats each end as a semicircle. The
+    // actual feet end square: opposite braces can be clear across a thin part.
+    if (planDist(stripPlan(...rib.foot, rib.halfW), stripPlan(...r.foot, r.halfW)) < SWAY.clearance) return true;
     const top = Math.min(rib.height, r.height);
-    for (const L of rib.levels) {
-      if (L.z > top) break;
-      const M = levelAt(r.levels, L.z);
-      if (segDist(L.a, L.b, M.a, M.b) < need) return true;
+    const zs = new Set([...rib.levels, ...r.levels].filter((L) => L.z <= top).map((L) => L.z));
+    zs.add(top);
+    for (const z of zs) {
+      const L = levelAt(rib.levels, z), M = levelAt(r.levels, z);
+      if (planDist(stripPlan(L.a, L.b, rib.th / 2), stripPlan(M.a, M.b, r.th / 2)) < SWAY.clearance) return true;
+    }
+    for (const arm of rib.arms ?? []) {
+      if (planDist(arm.plan, bodyPlan(r)) < SWAY.clearance) return true;
+      for (const other of r.arms ?? []) {
+        if (planDist(arm.plan, other.plan) < SWAY.clearance) return true;
+      }
+    }
+    for (const arm of r.arms ?? []) {
+      if (planDist(bodyPlan(rib), arm.plan) < SWAY.clearance) return true;
     }
   }
   return false;
@@ -426,20 +553,24 @@ function levelAt(levels, z) {
  * records carry a centreline (`line`, world points), so this compares the rib's
  * FOOT against that line in XY -- the bed is where both are widest, and a support
  * that clears there is clear the whole way up, since both taper inward with height.
+ * Profiled ribs also check their full body projection: the inner edge can bend.
  *
  * @param walls  array of polylines ([[x, y, z], ...]), e.g. `built.fins[i].line`
  */
 export function swayClashesWall(rib, walls) {
   if (!walls?.length) return false;
   const need = rib.halfW + SWAY.wallHalf + SWAY.clearance;
+  const plan = rib.profiled ? bodyPlan(rib) : null;
   for (const line of walls) {
     if (!Array.isArray(line) || line.length < 1) continue;
     if (line.length === 1) {
       const p = line[0];
+      if (plan && planDist(plan, [p]) < SWAY.wallHalf + SWAY.clearance) return true;
       if (segDist(rib.foot[0], rib.foot[1], p, p) < need) return true;
       continue;
     }
     for (let i = 1; i < line.length; i++) {
+      if (plan && planDist(plan, [line[i - 1], line[i]]) < SWAY.wallHalf + SWAY.clearance) return true;
       if (segDist(rib.foot[0], rib.foot[1], line[i - 1], line[i]) < need) return true;
     }
   }
@@ -454,6 +585,32 @@ function avoidance(avoid) {
   if (!avoid) return { braces: [], walls: [] };
   if (Array.isArray(avoid)) return { braces: avoid, walls: [] };
   return { braces: avoid.braces ?? [], walls: avoid.walls ?? [] };
+}
+
+/**
+ * A `crossClear` for braceCrossRib: a cross rib's plan footprint (its own
+ * triangles, flange included) has to stay SWAY.clearance off the braces and prop
+ * walls already standing. Convex projections include the leaning stem and flange.
+ */
+function armClear(braces, walls) {
+  return (tris) => {
+    const plan = planHull(tris);
+    for (const r of braces) {
+      if (!r?.foot) continue;
+      if (planDist(plan, bodyPlan(r)) < SWAY.clearance) return false;
+      for (const arm of r.arms ?? []) {
+        if (planDist(plan, arm.plan) < SWAY.clearance) return false;
+      }
+    }
+    for (const line of walls ?? []) {
+      if (!Array.isArray(line) || !line.length) continue;
+      const pts = line.length === 1 ? [line[0], line[0]] : line;
+      for (let i = 1; i < pts.length; i++) {
+        if (planDist(plan, [pts[i - 1], pts[i]]) < SWAY.wallHalf + SWAY.clearance) return false;
+      }
+    }
+    return true;
+  };
 }
 
 const clashes = swayClashes;
@@ -548,7 +705,8 @@ export function buildSwayBraces(topo, result, rot, opts = {}) {
       for (const du of SWAY.nudges) {
         const uc = u + du;
         if (uc < p.u0 || uc > p.u1) continue;
-        const r = buildSwayRib(p, uc, partTris, topo, rot, result.offset, opts);
+        const r = buildSwayRib(p, uc, partTris, topo, rot, result.offset,
+                              { ...opts, crossClear: armClear(ribs, walls) });
         if (r.ok && !clashes(r, ribs) && !swayClashesWall(r, walls)) { placed = r; break; }
       }
       if (!placed) { skipped++; continue; }
@@ -584,19 +742,22 @@ export function faceIsUpright(topo, rot, faceIndex) {
   const i = faceIndex * 3;
   const x = topo.nrm[i], y = topo.nrm[i + 1], z = topo.nrm[i + 2];
   const nz = rot[2] * x + rot[5] * y + rot[8] * z;
-  return Math.abs(nz) <= leanCut();
+  return takesBrace(nz);
 }
 
 /**
  * DRAW: a sway brace on the face the user clicked, at the spot they clicked.
- * `point` is in print space. `avoid` is the braces already standing (each a
- * buildSwayRib result); the new one may shift a few mm to clear them, and is
- * refused -- with that reason -- if it can't. Returns buildSwayRib's result.
+ * `point` is in print space; its z caps the brace's height, unless `opts.full`
+ * (the brace runs up the whole face, as it always did before the cap). `avoid` is
+ * the braces already standing (each a buildSwayRib result); the new one may shift a
+ * few mm to clear them, and is refused -- with the reason at the spot clicked -- if
+ * it can't. Returns buildSwayRib's result.
  */
 export function swayAtFace(topo, result, rot, faceIndex, point, opts = {}, avoid = []) {
   // A brace you clicked is a brace you meant, so the stilt limit Auto obeys is
   // advisory here: it builds and reports `stilt` for the readout to mention.
-  opts = { allowStilt: true, ...opts };
+  const cap = Number.isFinite(opts.maxHeight) ? opts.maxHeight : Infinity;
+  opts = { allowStilt: true, ...opts, maxHeight: opts.full ? cap : Math.min(point[2], cap) };
   const { byFace, partTris } = patchesFor(topo, rot, result.offset);
   const p = byFace.get(faceIndex);
   if (!p) return { ok: false, reason: 'that face is too small or curved to stand a brace against' };
@@ -605,11 +766,12 @@ export function swayAtFace(topo, result, rot, faceIndex, point, opts = {}, avoid
   let last = null, hitBrace = false, hitWall = false;
   for (const du of [0, 2, -2, 4, -4]) {
     const uc = Math.max(p.u0, Math.min(p.u1, u + du));
-    const r = buildSwayRib(p, uc, partTris, topo, rot, result.offset, opts);
+    const r = buildSwayRib(p, uc, partTris, topo, rot, result.offset,
+                          { ...opts, crossClear: armClear(braces, walls) });
     if (r.ok && swayClashes(r, braces)) { hitBrace = true; continue; }
     if (r.ok && swayClashesWall(r, walls)) { hitWall = true; continue; }
     if (r.ok) return r;
-    last = r;
+    last ??= r;   // the clicked spot's own reason, not the last nudge's
   }
   if (hitBrace) {
     return { ok: false, reason: 'it would run into another brace (on the facing wall, or right beside it) '

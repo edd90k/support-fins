@@ -24,11 +24,11 @@ now you had to CAD it by hand every time.
 
 ## How it works
 
-1. Import an STL, 3MF or STEP.
+1. Import an STL, 3MF, STEP or OBJ.
 2. Rotate it. You're in control — Support Fins suggests, it never decides for you.
 3. It shows you live: overhang count, how many can take a real fin, height, bed contact.
-   Point at the load direction, answer one question — *does it pull apart, or does it
-   lever?* — and it scores orientations for strength too.
+   Point at the load direction, answer one question — _does it pull apart, or does it
+   lever?_ — and it scores orientations for strength too.
 4. Export. Fins and a bed pad come baked into the STL (or 3MF).
 
 **Why you pick the rotation, not the software:** "stronger" means nothing without a load
@@ -45,11 +45,40 @@ engine is validated against third-party STLs and pinned by an offline test suite
 Working: overhang detection, bed-reachability, contoured breakaway fin walls, orientation +
 load-direction scoring, the combined fin (wall + tines that fuse into the part — the whole
 point; see `docs/FIN-SPEC.md`), optional sway braces that tie tall parts' sides on all
-the way up (auto, or click an upright side in Draw), STL, 3MF and STEP import, STL and 3MF export.
+the way up (auto, or click an upright side in Draw), STL, 3MF, STEP and OBJ import, STL and 3MF export.
 
 Still open: scale-aware fin profiles, and the bed pad on tilted exports.
 
+### Nozzle size and wall lines
+
+Set **Nozzle** (0.2–2.0 mm) to your printer's nozzle and the support widths follow it;
+**Wall lines** (2 / 4 / 6 / 8) makes walls, wedges and sway braces thicker for tall parts.
+The contact tip and tines stay one line wide either way. See
+[the nozzle guide](docs/NOZZLE.md) for the sizes and what to check in the slicer.
+
+### Rounded support feet
+
+**Rounded feet** optionally rounds the corners of FDM bed-standing wall,
+squat, wedge and Sway feet inside their existing clearance envelope. It starts
+off, so existing geometry stays unchanged. Vertical/resin pin mode keeps its own
+windowed/undercut feet, even if the setting is saved as on. The choice is undoable and saved in
+3MF sessions. Engine callers opt in with `tunables: { roundFeet: true }`;
+direct Sway callers use `roundFeet: true`. Omitted/false restores ordinary feet.
+Segment joints overlap inside the foot contour rather than meeting face to face.
+Rounding removes corner area; plate adhesion and tall-print stability have not
+been physically compared. Check the sliced first layers and print-test before
+using it for tall parts.
+
 ### Sway braces for tall parts
+
+**Full brace depth** is an optional checkbox under Sway. It starts off, keeping
+the usual 60 mm depth limit. On, **Brace depth** uses its selected 5–50% of the
+actual brace height beyond that limit: a 999 mm brace at 15% reaches about 150 mm.
+The wider foot needs more plate space and material; model/support collisions can
+still shorten or refuse a brace. Check the build-volume preview and sliced first
+layers. Thickness, contact tines and grip rules are unchanged; deeper metre-high
+braces have not been physically print-tested. Undo/redo and 3MF sessions retain
+the checkbox. Direct callers opt in with `sway: { on: true, uncappedDepth: true }`.
 
 Tall, slender parts have a problem the fins were never built for: nothing overhangs, but
 as the part grows, the nozzle's drag and each layer shrinking as it cools push the top
@@ -63,6 +92,7 @@ up the full height**, tie it to the part. Like every support here, it stands off
 breakaway gap and snaps off; only the tines touch the part.
 
 **Using it:** tick **Sway braces (tall parts)** in the options panel. It's off by default.
+
 - **Auto** braces the tallest sides for you: up to four faces facing different ways, so
   both axes are held, with each rib placed where its face reaches highest.
 - **Draw**: one click on an upright side stands a brace there. Click a support you placed
@@ -97,7 +127,7 @@ notice.)
 
 The export ships **pure geometry with no slicer profile embedded** on purpose: baking
 in a profile would silence the notice but replace whoever-opens-it's printer/filament/
-print settings with ours on load, and it would have to be re-authored per slicer *and*
+print settings with ours on load, and it would have to be re-authored per slicer _and_
 per slicer version — a worse trade than a one-time, benign notice on a file whose
 geometry is already right. See `web/threemf.js` for the writer.
 
@@ -117,17 +147,26 @@ to expose it to the local network — handy on a headless box like a Raspberry P
 behind a firewall; the script prints the LAN address to open. The port is an
 optional positional argument and `--help` lists every option.
 
-Or run the same `web/` directory in Docker — nginx on the host's 8731, so the URL
-is identical to the dev server:
+### Run with Docker
 
 ```bash
-docker compose up --build        # http://localhost:8731/
+docker compose pull web
+docker compose up -d        # http://localhost:8731/
 ```
 
-There's no build step and no backend, so the image is just `nginx:stable-alpine`
-serving static files with cache headers that match the dev server. See
-[`docker-compose.yml`](docker-compose.yml), [`Dockerfile`](Dockerfile), and
-[`nginx.conf`](nginx.conf).
+This uses the latest stable release by default.
+
+To pin a release, add this to a `.env` file beside `docker-compose.yml`:
+
+```env
+SUPPORT_FINS_VERSION=v1.0.0
+```
+
+To build the checked-out source instead:
+
+```bash
+docker compose up --build
+```
 
 The Python prototype is the proof of concept the engine was ported from — plain mesh math,
 no CAD kernel:
@@ -146,18 +185,32 @@ Tests (Deno for the JS engine):
 deno test --allow-read tests/
 ```
 
-## The PrusaSlicer plugin (exploratory — not currently working)
+### Releases
 
-**Status: exploratory. This does not currently work — treat it as a research spike, not a
-usable feature.** `plugins/prusa/` is an in-progress attempt at a native PrusaSlicer 3.0 companion.
-It can't do the automatic tool — the 3.0 plugin sandbox can't read a loaded mesh's triangles
-— and the intended fallback (generating the fin natively: an overhang test object, a
-standalone breakaway fin you position by hand, and a combined tine demo) is not functional
-yet. Kept in the repo for reference only. Use the browser app instead. See `plugins/prusa/README.md`.
+`main` is staging: once Cloudflare deploys the `live` branch, every merge shows up at the
+`main` preview, not on printfins.com.
+A PR that changes what a user sees adds one line to `unreleased` in `web/changelog.json`.
+To ship, run Actions > release > Run workflow (version empty for the next patch, or say
+`1.1.0`). It stamps everything unreleased under that version, writes the landing card's
+What's new list into `web/index.html`, runs the tests and pushes that as one release
+commit to `main`; then it tags it, moves the `live` branch printfins.com deploys from,
+attaches the plugin builds and publishes the Docker image. Fix an entry's wording on `main`
+before you run it. Releases are on the
+[Releases page](https://github.com/gittrahan/support-fins/releases) and the site's landing card.
+
+## The PrusaSlicer plugin (hand-placed)
+
+`plugins/prusa/` is a native PrusaSlicer 3.0 plugin, **Support Fins → Add a Fin**. The 3.0
+plugin sandbox can't read a loaded mesh's triangles, so it can't do the automatic tool. It
+drops one angled-print support fin instead: a thin triangle whose slope you set 0.2 mm under
+a tilted part's underside, with one-layer tines along it (Slope Angle, Fin Height, Tine
+Spacing). You place it by hand; size it with Fin Height rather than the slicer's scale tool,
+which would stretch the one-layer tines. Confirmed working in PrusaSlicer 3.0 alpha11
+(2026-10-02). For fins shaped to the part automatically, use the browser app. See `plugins/prusa/README.md`.
 
 ## Honest limitations
 
-- Overhangs sitting over the *part* rather than the plate aren't handled — fins attach to
+- Overhangs sitting over the _part_ rather than the plate aren't handled — fins attach to
   the bed only.
 - Features shorter than roughly a 4 mm wall height are too short for a real fin.
 - It won't pick your orientation for you. On purpose.
@@ -166,9 +219,11 @@ yet. Kept in the repo for reference only. Use the browser app instead. See `plug
 
 ```
 web/         the browser app (live at printfins.com)
-plugins/     slicer/CAD integrations (PrusaSlicer, OrcaSlicer, Onshape)
+plugins/     slicer/CAD integrations (PrusaSlicer, OrcaSlicer, Onshape, Autodesk Fusion), the
+             command line, and an MCP server for AI clients
 prototype/   Python/trimesh proof of concept the engine was ported from
-docs/        FIN-SPEC.md — the verified fin geometry, with sources
+docs/        FIN-SPEC.md — the verified fin geometry, with sources; PLUGIN-CONFIG.md —
+             every plugin setting (Orca config keys, CLI flags)
 tests/       offline geometry regression suite
 ```
 
@@ -188,6 +243,9 @@ Fins are entirely yours, and the output carries no license obligation.
 STEP import uses [occt-import-js](https://github.com/kovacsv/occt-import-js) (Open CASCADE
 compiled to WebAssembly), vendored unmodified under `web/vendor/occt-import-js-0.0.23/` with its
 LGPL-2.1 license files. The browser only downloads it when you go to import a file.
+
+Pointer picks on dense parts use [three-mesh-bvh](https://github.com/gkjohnson/three-mesh-bvh),
+vendored unmodified under `web/vendor/three-mesh-bvh-0.9.15/` with its MIT license.
 
 ---
 

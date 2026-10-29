@@ -3,7 +3,8 @@
 // part's flank -- and stay watertight. These pin all three so a revert to the grid
 // (or a broken mesh) fails loudly.
 
-import { loadModel, analyze, fins, isClosed, rotX, assert } from './_util.js';
+import { loadModel, analyze, fins, isClosed, isOriented, rotX, assert, block, WEB } from './_util.js';
+const { buildPad } = await import(`${WEB}fins/pad.js`);
 
 // Build with a pad style set for this call only (PAD.style is module state).
 function withStyle(style, fn) {
@@ -145,6 +146,19 @@ Deno.test('pad (brim): one layer thick, whatever the layer height', () => {
   }
 });
 
+// Every pad style is one consistently wound outward solid. The Light/Custom top grid
+// once ran the other way to its tip fans, side wall and bottom: closed, but with
+// the top inside-out against the rest. Bambu misread it and refused the
+// separate-object 3MF ("G-code path conflicts" with the part); PrusaSlicer warned.
+Deno.test('pad: every style is wound consistently outward, at any tilt', () => {
+  for (const style of ['light', 'sure', 'custom']) for (const deg of [20, 45, 60]) {
+    const topo = loadModel('cube'), rot = rotX(deg);
+    const b = withStyle(style, () => fins.buildFins(topo, analyze(topo, 45, rot), rot, { mode: 'auto', bedPad: true, tines: true }));
+    assert(b.padTriangles.length > 0, `${style} X${deg}: no pad`);
+    assert(isOriented(b.padTriangles), `${style} X${deg}: pad has faces wound against their neighbours`);
+  }
+});
+
 // What the SLICER sees: the pad's and the part's sections at the first layer's
 // mid-height. PrusaSlicer / Orca / Bambu merge any gap under 2 x 0.049mm, so the
 // sliced gap must clear 0.098 -- at every tilt, not just 45deg: 0.1mm through a
@@ -272,4 +286,49 @@ Deno.test('pad: the small-foot Sure hold meets the part even on PETG numbers', (
   let min = Infinity;
   for (const s of pad) for (const q of ps) min = Math.min(min, segDist(s, q));
   assert(min < 0.05, `swapped pad stands ${min.toFixed(3)}mm off the sphere's first layer -- it holds nothing`);
+});
+
+// The Light/Custom pad meshes 0.1mm only where the part comes near it. Its rows
+// used to be shared by every column, so one dip near the rim made the whole oval
+// fine: 2M cells under a 128mm figure in Suggest, and a RangeError at 4x. Here a
+// 6mm post stands near the rim of a 108 x 78mm pad.
+Deno.test('pad (light): a big pad is fine only near the part, and keeps its gap there', () => {
+  const part = block(-3, 3, 30, 36, 0, 10);
+  const contact = [[-50, -35], [50, -35], [50, 35], [-50, 35]];
+  const out = [];
+  const p = withStyle('light', () => buildPad(contact, part, out, 0.2));
+  assert(p.r1 > 50 && p.r2 > 35, `pad is ${p.r1} x ${p.r2}, not the big oval`);
+  assert(p.cells < 30000, `${p.cells} cells -- the whole oval went fine`);
+  assert(isClosed(out) && isOriented(out), 'big pad is not one closed, outward solid');
+  const tris = [];
+  for (let i = 0; i < part.length; i += 3) tris.push([part[i], part[i + 1], part[i + 2]]);
+  const ps = sectionSegs(tris, 0.1), pad = sectionSegs(out, 0.1);
+  let min = Infinity;
+  for (const s of pad) for (const q of ps) min = Math.min(min, segDist(s, q));
+  assert(min > 0.1 && min < fins.PAD.brimGap + 0.05, `sliced gap round the post is ${min.toFixed(3)}mm`);
+});
+
+// Near the oval's tips a coarse block's fan could fold back over its neighbours:
+// reversed facets lying on the top, which isClosed and isOriented both pass (the
+// pad that Bambu refused was broken in this way). Every top facet must face up.
+Deno.test('pad (light): no top facet folds over, even at the oval\'s tips', () => {
+  // 10.4 by steps, + margin 4: r1 = 14.400000000000006, which leaves a 1-column
+  // block at the tip
+  let E = 10;
+  for (let k = 0; k < 8; k++) E += 0.05;
+  for (const [contact, part] of [
+    [[[-E, -5], [E, -5], [E, 5], [-E, 5]], block(-3, 3, -3, 3, 0, 10)],
+    [[[-50, -35], [50, -35], [50, 35], [-50, 35]], block(-3, 3, 30, 36, 0, 10)],
+  ]) {
+    const out = [];
+    withStyle('light', () => buildPad(contact, part, out, 0.2));
+    let up = 0, down = 0;
+    for (let i = 0; i < out.length; i += 3) {
+      const [p, q, r] = [out[i], out[i + 1], out[i + 2]];
+      if (Math.min(p[2], q[2], r[2]) <= 0) continue;          // side wall, bottom
+      const nz = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+      if (nz > 1e-10) up++; else if (nz < -1e-10) down++;
+    }
+    assert(up > 0 && down === 0, `${down} top facets face down (contact x +-${E})`);
+  }
 });

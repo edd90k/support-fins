@@ -1,0 +1,83 @@
+{
+  "scene": {
+    "name": "staircase-x40-auto",
+    "model": "staircase",
+    "rot": [
+      40,
+      0,
+      0
+    ]
+  },
+  "walls": 4,
+  "tines": 20,
+  "unserved": 0,
+  "triangles": 2128,
+  "padTriangles": 44230,
+  "fins": [
+    {
+      "kind": "prop",
+      "height": 14.676,
+      "length": 16.751,
+      "tines": 0,
+      "from": [
+        5.88,
+        -3.813,
+        0.62
+      ],
+      "to": [
+        5.88,
+        12.939,
+        14.676
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 14.676,
+      "length": 16.751,
+      "tines": 0,
+      "from": [
+        -5.88,
+        -3.813,
+        0.62
+      ],
+      "to": [
+        -5.88,
+        12.939,
+        14.676
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 22.94,
+      "length": 26.6,
+      "tines": 0,
+      "from": [
+        -17.64,
+        -3.813,
+        0.62
+      ],
+      "to": [
+        -17.64,
+        22.788,
+        22.94
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 22.94,
+      "length": 26.6,
+      "tines": 0,
+      "from": [
+        -29.4,
+        -3.813,
+        0.62
+      ],
+      "to": [
+        -29.4,
+        22.788,
+        22.94
+      ]
+    }
+  ],
+  "sha256": "4051eb92bb4a0df48c5aa31b05f823c4f42ce74df3cf5abd6a40aa075384d09a"
+}

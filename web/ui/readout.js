@@ -1,16 +1,31 @@
+import { t, tn } from './i18n.js';
 /**
  * The status readout: the Fins/Pad rows, the note under them and its (i), the
  * grams receipt, and why a part got no fins.
  */
-import { PAD } from '../fins.js';
+import { FIN, PAD } from '../fins.js';
+import { bareArea, fillReach } from '../fins/fill.js';
+import { PROP } from '../prop.js';
 import { el } from './dom.js';
+
+// Vertical tines are resin pins (#309, prop/pins.js): count them as what they are.
+const pinsOn = () => PROP.tineDir === 'vertical';
+const tineCount = (n) => (pinsOn() ? tn('{n} pin', '{n} pins', n) : tn('{n} tine', '{n} tines', n));
 import { removedIds } from './remove.js';
-import { drawnWalls, drawMsg, selectedWall, selectedNote, drawShown, drawMaterial } from './walls.js';
+import { drawnWalls, drawMsg, selectedWall, selectedNote, drawShown, drawMaterial, drawShapeNow } from './walls.js';
 import {
-  finMode, finsVisible, materialDensity, syncSectionSums,
+  finMode, finsVisible, materialDensity, syncSectionSums, autoLike,
 } from './settings.js';
-import { analysisTiming } from '../app.js';
-import { activeAdded, finMaterial, padMaterial } from './finbuild.js';
+import { analysisTiming, topology, lastResult, rotM3 } from './part.js';
+import { islandsBuilt } from './islands.js';
+import { ifaceMaterial } from './scene.js';
+import { activeAdded, activeWalls, finMaterial, padMaterial } from './finbuild.js';
+import { syncReport } from './report.js';
+
+// The "fins won't hold most of this" warning (updateReadout): over half the red bare,
+// and at least this much of it, so a part with a few bare slivers isn't told to
+// reach for tree supports.
+const MOSTLY_BARE = { share: 0.5, area: 25 };
 
 /**
  * Why did this part get no fins, in terms the user can act on?
@@ -27,59 +42,78 @@ function explainNoFins(b) {
   // something that was never the problem. This outranks every mode-specific
   // reason below.
   if (b.seating?.kind === 'point' && !b.pad) {
-    return 'this part touches the plate at a single point, so it has nothing to '
-         + 'stand on. Turn the bed pad on to seat it, or rotate until it sits '
-         + 'down on a face or an edge';
+    return t('this part touches the plate at a single point, so it has nothing to '
+      + 'stand on. Turn the bed pad on to seat it, or rotate until it sits '
+      + 'down on a face or an edge');
+  }
+  // Plate only (#218) emptied it: in any mode, that is the reason to name
+  if (b.skipped?.onPart) {
+    return t('part of the model sits under these overhangs, and Plate only is on — '
+         + 'untick it to stand supports on the part, or rotate');
+  }
+  if (onlySmallHoles(b)) {
+    return t('recognised small-hole ceilings are left unsupported to keep their openings clear; check bridging in the slicer');
   }
   if (b.mode === 'prop') {
     const s = b.skipped ?? {};
-    if (!b.rejected.sites) return 'no overhangs to prop in this orientation';
+    if (!b.rejected.sites) return t('no overhangs to prop in this orientation');
     // Named in the order that tells the user the most. Each is a different
     // stage of the search, and lumping them into "blocked" is what let M5 be
     // recorded as working on a part where it built nothing.
     if (s.wanders) {
-      const one = s.wanders === 1;
-      return `${s.wanders} overhang${one ? ' is' : 's are'} bowl-shaped rather than `
-           + `a ledge — ${one ? 'its' : 'their'} lowest points form a ring, not a `
-           + 'line, so there is nothing for a wall to follow. Rotate, or switch '
-           + 'to Draw and place one by hand';
+      return tn('{n} overhang is bowl-shaped rather than a ledge — its lowest points form a ring, not a '
+                + 'line, so there is nothing for a wall to follow. Rotate, or switch to Draw and place one by hand',
+                '{n} overhangs are bowl-shaped rather than a ledge — their lowest points form a ring, not a '
+                + 'line, so there is nothing for a wall to follow. Rotate, or switch to Draw and place one by hand',
+                s.wanders);
     }
     if (s.buried || s.weld) {
-      return 'every wall that reaches these overhangs would fuse to the '
-           + 'part — rotate, or switch to Draw and place one by hand';
+      return t('every wall that reaches these overhangs would fuse to the '
+           + 'part — rotate, or switch to Draw and place one by hand');
     }
     if (s.blocked) {
-      return 'no run of these overhangs is long enough to stand a wall under — '
-           + 'the part is in the way, or they sit too close to the plate';
+      return t('no run of these overhangs is long enough to stand a wall under — '
+           + 'the part is in the way, or they sit too close to the plate');
     }
     if (s.stub || s.noLine || s.sliver) {
-      return 'the overhangs here are too small or too low to be worth a wall';
+      return t('the overhangs here are too small or too low to be worth a wall');
     }
     if (s.degenerate) {
-      return 'the contact lines here collapse to a point — nothing to sweep along';
+      return t('the contact lines here collapse to a point — nothing to sweep along');
     }
-    return 'no overhang here can take a prop in this orientation';
+    return t('no overhang here can take a prop in this orientation');
   }
   const st = b.patchStats ?? {};
   if (!b.patchCount) {
     // a cylinder or a mesh of small facets has no flat face wide enough
     return (st.tooNarrow ?? 0) > (st.notFlat ?? 0)
-      ? 'nothing flat and wide enough to stand a fin against — curved or '
-        + 'finely faceted surfaces have no flat face to grip'
-      : 'no flat upright face on this part in this orientation';
+      ? t('nothing flat and wide enough to stand a fin against — curved or '
+        + 'finely faceted surfaces have no flat face to grip')
+      : t('no flat upright face on this part in this orientation');
   }
   if (!b.rejected.sites) {
     return st.tooHigh
-      ? `${st.tooHigh} flat face${st.tooHigh === 1 ? '' : 's'} found, but every `
-        + 'one starts too far up the part — a fin would be mostly bare stilt. '
-        + 'Rotate so a flat face runs down to the plate'
-      : 'no usable face in this orientation — try rotating';
+      ? tn('{n} flat face found, but every one starts too far up the part — a fin would be mostly bare stilt. '
+           + 'Rotate so a flat face runs down to the plate',
+           '{n} flat faces found, but every one starts too far up the part — a fin would be mostly bare stilt. '
+           + 'Rotate so a flat face runs down to the plate', st.tooHigh)
+      : t('no usable face in this orientation — try rotating');
   }
   if (b.rejected.blocked) {
-    return 'the part is in the way of every wall position on the faces it found '
-         + '— rotate, or switch to Draw and place one by hand';
+    return t('the part is in the way of every wall position on the faces it found '
+         + '— rotate, or switch to Draw and place one by hand');
   }
-  return 'the workable spots would put the fin inside the part — try rotating';
+  return t('the workable spots would put the fin inside the part — try rotating');
+}
+
+// An intentional empty result is different from a failed placement. Do not let
+// a hole beside another target, or an unsafe part, hide the real failure.
+function onlySmallHoles(b) {
+  return b.mode !== 'draw' && b.smallHoleRegions > 0
+    && b.smallHoleRegions === lastResult?.regions.length
+    && !b.unserved && !b.skipped?.onPart && !b.floating?.length
+    && !b.sway?.reason
+    && !(b.seating?.kind === 'point' && !b.pad);
 }
 
 // Grams use the selected material's density (materialDensity, set by applyMaterial),
@@ -120,10 +154,32 @@ function updateReceipt() {
 }
 
 /** Route the readout to the active mode. */
+let lastBuilt = null;
+let lastMs = null;
+
 export function updateReadout(built, ms) {
+  lastBuilt = built;
+  if (ms != null) lastMs = ms;
   if (finMode === 'draw') updateDrawReadout(built, ms);
   else updateFinReadout(built, ms);
+  // the midair-starts card: what Full coverage's walls left bare (a Full build with no
+  // fill pass -- a point-seated part, pad off -- walls none), else the plain count
+  islandsBuilt(finsVisible && finMode === 'full' && built
+    ? (built.fill ? { bare: built.fill.islandsBare, capped: built.fill.islandsCapped } : { all: true }) : null);
   updateReceipt();
+  syncReport();
+}
+
+/**
+ * Flat contacts is on and there are walls, but no wall top got a crest (every contact
+ * tilted): say so, or the export quietly has no interface part to set. Walls only --
+ * a pad alone is no support to put an interface on.
+ */
+function ifaceNote() {
+  if (PROP.iface !== 'flat') return null;
+  const tris = activeWalls();
+  if (!tris.length || tris.some((v) => v[3] === 1)) return null;
+  return t('Interface material: no flat contacts here, so every support prints in one material');
 }
 
 /**
@@ -148,8 +204,8 @@ function setFinNote(lead, detail) {
  * the exact bug M5's scoreboard was built on.
  */
 function updateDrawReadout(built, ms) {
-  finMaterial.transparent = padMaterial.transparent = drawMaterial.transparent = false;
-  finMaterial.opacity = padMaterial.opacity = drawMaterial.opacity = 1;
+  finMaterial.transparent = padMaterial.transparent = drawMaterial.transparent = ifaceMaterial.transparent = false;
+  finMaterial.opacity = padMaterial.opacity = drawMaterial.opacity = ifaceMaterial.opacity = 1;
   const box = el('s-fins');
   el('s-pad').textContent = built ? padStatus(built) : '—';
 
@@ -158,25 +214,32 @@ function updateDrawReadout(built, ms) {
   const tines = ok.reduce((a, w) => a + (w.info?.tines ?? 0), 0);
   const braces = ok.filter((w) => w.kind === 'sway').length;
   const walls = ok.length - braces;
+  const ribs = ok.reduce((a, w) => a + (w.kind === 'sway' ? 0 : w.info?.braces ?? 0), 0);
+  const crosses = ok.reduce((a, w) => a + (w.kind === 'sway' ? w.info?.cross ?? 0 : 0), 0);
   const parts = [];
-  if (walls) parts.push(`${walls} drawn wall${walls === 1 ? '' : 's'}`);
-  if (braces) parts.push(`${braces} sway brace${braces === 1 ? '' : 's'}`);
+  if (walls) parts.push(tn('{n} drawn wall', '{n} drawn walls', walls) + (ribs ? ` · ${tn('{n} wall rib', '{n} wall ribs', ribs)}` : ''));
+  if (braces) parts.push(tn('{n} sway brace', '{n} sway braces', braces)
+    + (crosses ? ` · ${tn('{n} brace rib', '{n} brace ribs', crosses)}` : ''));
   box.textContent = ok.length
-    ? parts.join(' + ') + (tines ? ` · ${tines} tines` : '')
-    : 'none yet';
+    ? parts.join(' + ') + (tines ? ` · ${tineCount(tines)}` : '')
+    : t('none yet');
   box.classList.toggle('warn', ok.length === 0);
 
   const lead = [];
   const help = [];
   if (!drawnWalls.length && !drawMsg) {
-    lead.push('Click two points across an overhang (a line lands right where you '
-      + 'draw it, red faces included) to lay a breakaway wall under it');
+    lead.push(drawShapeNow() === 'curve'
+      ? t('Click the two ends of a curve on the overhang, then a point it runs through, '
+        + 'to lay a curved breakaway wall under it')
+      : t('Click two points across an overhang (a line lands right where you '
+        + 'draw it, red faces included) to lay a breakaway wall under it'));
   }
   if (ok.length) {
     help.push(tines
-      ? 'The tines grab onto the part and bend away when you snap the wall off.'
-      : 'Each wall stops a hair under the part (0.2mm) so it snaps off clean. Turn '
-        + 'Tines on if you want it to grip the part.');
+      ? (pinsOn() ? t('The pins attach each wall to the part, as a resin print needs.')
+        : t('The tines grab onto the part and bend away when you snap the wall off.'))
+      : t('Each wall stops a hair under the part (0.2mm) so it snaps off clean. Turn '
+        + 'Tines on if you want it to grip the part.'));
   }
   // A brace you place by hand is built even where Auto would refuse to stand one,
   // so say what it is doing: below its first tine it holds nothing and nothing
@@ -184,62 +247,66 @@ function updateDrawReadout(built, ms) {
   const stilted = ok.filter((w) => w.kind === 'sway' && (w.info?.stilt ?? 0) > 20);
   if (stilted.length) {
     const tallest = Math.max(...stilted.map((w) => w.info.stilt));
-    help.push(`${stilted.length === 1 ? 'One brace stands' : `${stilted.length} braces stand`} `
-      + `up to ${Math.round(tallest)}mm before gripping the part — that much of it prints as a `
-      + 'lone wall. Fine if it prints; rotate so that side reaches the plate if it wobbles.');
+    help.push(tn('One brace stands up to {mm}mm before gripping the part — that much of it prints as a '
+                 + 'lone wall. Fine if it prints; rotate so that side reaches the plate if it wobbles.',
+                 '{n} braces stand up to {mm}mm before gripping the part — that much of it prints as a '
+                 + 'lone wall. Fine if it prints; rotate so that side reaches the plate if it wobbles.',
+                 stilted.length, { mm: Math.round(tallest) }));
   }
   if (bad) {
     const one = drawnWalls.find((w) => !w.ok);
-    lead.push(`${bad} wall${bad === 1 ? '' : 's'} couldn’t build here`
-      + `${one?.info?.reason ? ` (${one.info.reason})` : ''}. Undo, or redraw`);
+    const reason = one?.info?.reason ? ` (${t(one.info.reason)})` : '';
+    lead.push(tn('{n} wall couldn’t build here{reason}. Undo, or redraw',
+                 '{n} walls couldn’t build here{reason}. Undo, or redraw', bad, { reason }));
   }
   if (drawMsg) lead.push(drawMsg);
   if (selectedWall) lead.push(selectedNote());
   if (built?.seating?.kind === 'point') {
     lead.push(built.pad
-      ? 'this part balances on one point, so the bed pad is holding it. Print with the pad on'
-      : 'this part balances on one point. Turn the bed pad on to seat it, or rotate until it sits down');
+      ? t('this part balances on one point, so the bed pad is holding it. Print with the pad on')
+      : t('this part balances on one point. Turn the bed pad on to seat it, or rotate until it sits down'));
   }
   if (built && padNote(built)) lead.push(padNote(built));
+  const iface = ifaceNote();
+  if (iface) lead.push(iface);
   setFinNote(lead, help);
-  if (ms != null) el('s-time').textContent = `${analysisTiming} · pad ${ms.toFixed(0)} ms`;
+  if (ms != null) el('s-time').textContent = `${analysisTiming} · ${t('pad')} ${ms.toFixed(0)} ms`;
 }
 
 /**
  * The Light pad grips by first-layer squish along the part's first-layer outline.
- * A part on a point or a small round foot has only a few mm of it, so fins.js
+ * A part on a point or a small round foot has only a few mm of it, so fins/pad.js
  * builds Sure hold there instead (pad.autoSure) -- say so, since the user picked
  * Light. A Custom pad with a gap on such a foot gets a warning instead of a swap.
  */
 function padStatus(built) {
   syncAutoLabel(built);
-  if (!built.pad) return 'not needed';
-  return built.pad.autoSure ? 'Sure hold (small foot)' : 'added';
+  if (!built.pad) return t('not needed');
+  return built.pad.autoSure ? t('Sure hold (small foot)') : t('added');
 }
 // The Auto option names what it built, so the dropdown never claims Light while
 // the pad on screen is Sure hold.
 function syncAutoLabel(built) {
   const opt = el('bed-pad').querySelector('option[value="auto"]');
   const p = built?.pad;
-  opt.textContent = !p || PAD.style !== 'auto' ? 'Auto'
-    : p.style === 'sure' ? 'Auto (Sure hold)' : 'Auto (Light)';
+  opt.textContent = !p || PAD.style !== 'auto' ? t('Auto') : p.style === 'sure' ? t('Auto (Sure hold)') : t('Auto (Light)');
   syncSectionSums();
 }
 function padNote(built) {
   const p = built.pad;
   if (!p?.smallFoot) return '';
-  const mm = p.outline < 1 ? 'under 1 mm' : `${p.outline.toFixed(0)} mm`;
+  const mm = p.outline < 1 ? t('under 1 mm') : `${p.outline.toFixed(0)} mm`;
   if (p.autoSure) {
-    return `this part meets the plate on a small foot (${mm} of first-layer edge), too little for a `
-         + 'Light pad to grip, so Auto made it Sure hold, touching the part to hold it';
+    return t('this part meets the plate on a small foot ({mm} of first-layer edge), too little for a '
+         + 'Light pad to grip, so Auto made it Sure hold, touching the part to hold it', { mm });
   }
   if (PAD.style === 'light') {
-    return `this part meets the plate on a small foot (${mm} of first-layer edge); a Light pad has `
-         + 'almost nothing to grip. Auto or Sure hold holds it';
+    return t('this part meets the plate on a small foot ({mm} of first-layer edge); a Light pad has '
+         + 'almost nothing to grip. Auto or Sure hold holds it', { mm });
   }
   if (PAD.style === 'custom' && PAD.custom.gap > 0) {
-    return `this part meets the plate on a small foot (${mm} of first-layer edge); a pad with a gap `
-         + 'has almost nothing to grip. Sure hold, or Pad gap 0, holds it';
+    return t('this part meets the plate on a small foot ({mm} of first-layer edge); a pad with a gap '
+         + 'has almost nothing to grip. Sure hold, or Pad gap 0, holds it', { mm });
   }
   return '';
 }
@@ -261,63 +328,70 @@ function updateFinReadout(built, ms) {
   // Hand-added walls (Suggest + Draw mix) count toward the tally too.
   const drawnOk = drawShown() ? drawnWalls.filter((w) => w.ok).length : 0;
   let autoTxt;
-  if (built.mode === 'auto') {
+  if (autoLike(built.mode)) {
     // Named apart so the readout is honest: the support fins sit on the overhangs
     // (tined when the toggle is on), the props are the fallback under ledges too
     // flat to take a fin. "N fins" alone would hide which is which.
     const p = built.propCount, b = built.braceCount;
     const seg = [];
-    if (b) seg.push(`${b} support fin${b === 1 ? '' : 's'}` + (built.tines ? ` · ${built.tines} tines` : ''));
-    if (p) seg.push(`${p} prop${p === 1 ? '' : 's'}`);
+    if (b) seg.push(tn('{n} support fin', '{n} support fins', b) + (built.tines ? ' · ' + tineCount(built.tines) : ''));
+    if (p) seg.push(tn('{n} prop', '{n} props', p));
     autoTxt = seg.join(' + ');
   } else {
     autoTxt = n
-      ? `${n} ${kind === 'prop' ? 'prop' : 'support fin'}${n === 1 ? '' : 's'}`
-        + (built.mode === 'prop' || !built.tines ? '' : ` · ${built.tines} tines`)
+      ? (kind === 'prop' ? tn('{n} prop', '{n} props', n) : tn('{n} support fin', '{n} support fins', n))
+        + (built.mode === 'prop' || !built.tines ? '' : ` · ${tineCount(built.tines)}`)
       : '';
   }
-  const drawnTxt = drawnOk ? `${autoTxt ? ' + ' : ''}${drawnOk} drawn` : '';
+  const drawnTxt = drawnOk ? `${autoTxt ? ' + ' : ''}${t('{n} drawn', { n: drawnOk })}` : '';
   const removedN = removedIds.size;
-  const removedTxt = removedN ? ` (${removedN} removed)` : '';
+  const removedTxt = removedN ? ` (${t('{n} removed', { n: removedN })})` : '';
   const sw = built.sway;
+  const ribTxt = built.tallRibs ? ` · ${tn('{n} wall rib', '{n} wall ribs', built.tallRibs)}` : '';
   const swayTxt = sw?.count
-    ? `${autoTxt || drawnTxt ? ' + ' : ''}${sw.count} sway brace${sw.count === 1 ? '' : 's'}`
-      + (sw.tines ? ` · ${sw.tines} brace tines` : '')
+    ? `${autoTxt || drawnTxt ? ' + ' : ''}${tn('{n} sway brace', '{n} sway braces', sw.count)}`
+      + (sw.tines ? ` · ${t('{n} brace tines', { n: sw.tines })}` : '')
+      + (sw.cross ? ` · ${tn('{n} brace rib', '{n} brace ribs', sw.cross)}` : '')
     : '';
-  box.textContent = (autoTxt + drawnTxt + swayTxt + removedTxt) || 'none possible';
-  box.classList.toggle('warn', n === 0 && !drawnOk && !sw?.count);
+  const noneNeeded = !n && !removedN && !sw?.count
+    && !(drawShown() && drawnWalls.length) && onlySmallHoles(built);
+  box.textContent = (autoTxt + ribTxt + drawnTxt + swayTxt + removedTxt) || (noneNeeded
+    ? tn('none needed: small hole left for bridging', 'none needed: small holes left for bridging', built.smallHoleRegions)
+    : t('none possible'));
+  box.classList.toggle('warn', n === 0 && !drawnOk && !sw?.count && !noneNeeded);
 
   // `lead` = short + must-see, stays in the panel; `help` = how-it-works and
   // how-to-fix, goes behind the (i). Split so the panel doesn't read as a wall.
   const lead = [];
   const help = [];
   if (!n && !drawnOk) {
-    // Nothing placed -- the box already says "none possible"; the why goes in the
+    // Nothing placed -- the box names the outcome; the why goes in the
     // (i), since it's a paragraph and the user can hover for it.
     help.push(explainNoFins(built));
   } else if (n) {
-    if (built.mode === 'auto') {
+    if (autoLike(built.mode)) {
       // Make "why no tines" legible: props never take tines, only the gripping
       // fins do, so a part that gets only props shows no tines and that's correct.
       const b = built.braceCount, p = built.propCount;
       if (b) {
         help.push(built.tines
-          ? 'The tines grab onto the part and bend away when you snap the supports off.'
-          : 'The fins stand a hair off the part (0.2mm) so they pop off. Turn Tines on if you want them to grip.');
+          ? (pinsOn() ? t('The pins attach each wall to the part, as a resin print needs.')
+            : t('The tines grab onto the part and bend away when you snap the supports off.'))
+          : t('The fins stand a hair off the part (0.2mm) so they pop off. Turn Tines on if you want them to grip.'));
       }
       if (p && !b) {
-        help.push('These are plain props, not gripping fins. The overhangs here are '
-          + 'too shallow or curved to stand a fin against, so there are no tines to add.');
+        help.push(t('These are plain props, not gripping fins. The overhangs here are '
+          + 'too shallow or curved to stand a fin against, so there are no tines to add.'));
       } else if (p) {
-        help.push(`The ${p} prop${p === 1 ? '' : 's'} sit under overhangs too shallow `
-          + 'to grip, so those get no tines.');
+        help.push(tn('The {n} prop sit under overhangs too shallow to grip, so those get no tines.',
+                     'The {n} props sit under overhangs too shallow to grip, so those get no tines.', p));
       }
     } else if (built.mode === 'prop') {
-      help.push('Each one stops a hair under the part (0.2mm) so it pops off instead of needing a cut.');
+      help.push(t('Each one stops a hair under the part (0.2mm) so it pops off instead of needing a cut.'));
     }
   }
   if (drawnOk) {
-    lead.push(`plus ${drawnOk} wall${drawnOk === 1 ? '' : 's'} you added by hand`);
+    lead.push(tn('plus {n} wall you added by hand', 'plus {n} walls you added by hand', drawnOk));
   }
   // Hand-placement feedback has to surface here too (Suggest + Draw mix), or a
   // rejected wall fails silently -- the same silence-as-success trap as M5. This
@@ -326,8 +400,8 @@ function updateFinReadout(built, ms) {
     const bad = drawnWalls.length - drawnOk;
     if (bad) {
       const one = drawnWalls.find((w) => !w.ok);
-      lead.push(`${bad} drawn wall${bad === 1 ? '' : 's'} couldn’t attach here`
-              + (one?.info?.reason ? ` (${one.info.reason})` : ''));
+      const reason = one?.info?.reason ? ` (${t(one.info.reason)})` : '';
+      lead.push(tn('{n} drawn wall couldn’t attach here{reason}', '{n} drawn walls couldn’t attach here{reason}', bad, { reason }));
     }
     if (drawMsg) lead.push(drawMsg);
     if (selectedWall) lead.push(selectedNote());
@@ -337,51 +411,127 @@ function updateFinReadout(built, ms) {
   // not cosmetic. Must-see -> stays visible.
   if (n && built.seating?.kind === 'point') {
     lead.push(built.pad
-      ? 'this part balances on one point, so the bed pad is holding it. Print with the pad on'
-      : 'this part balances on one point with nothing under it. Turn the bed pad on, or rotate until it sits down');
+      ? t('this part balances on one point, so the bed pad is holding it. Print with the pad on')
+      : t('this part balances on one point with nothing under it. Turn the bed pad on, or rotate until it sits down'));
   }
   if (padNote(built)) lead.push(padNote(built));
+  if (built.floating?.length) {
+    const n = built.floating.length;
+    const drop = built.floating[0].drop.toFixed(1);
+    lead.push(tn('one piece of this part isn’t joined to the rest: it starts {drop} mm up, '
+                 + 'held only by supports. Check the model is one piece (a hole or cut may go right through)',
+                 '{n} pieces of this part aren’t joined to the rest: the first starts {drop} mm up, '
+                 + 'held only by supports. Check the model is one piece (a hole or cut may go right through)',
+                 n, { drop }));
+  }
   if (built.sagRisk) {
-    // The coverage slider is left of centre, so a broad flat overhang got rows
-    // spaced wider than the 12mm anti-sag guide. That's allowed on purpose (fewer
-    // supports), but the plate can bow between them -- must-see, so it's in the
-    // panel, not behind the (i).
-    lead.push('coverage is below the anti-sag guide, so a broad overhang may sag '
-            + 'between supports — nudge the slider right if the surface bows');
+    lead.push(t('coverage is below the anti-sag guide, so a broad overhang may sag '
+                + 'between supports — nudge the slider right if the surface bows'));
   }
-  if (built.unserved) {
-    // An un-served ledge is a shallow overhang with no room for a prop and too
-    // flat to stand a fin against. The fix (tilt steeper) is a sentence, so it
-    // rides in the (i) rather than the panel.
-    help.push(`${built.unserved} overhang${built.unserved === 1 ? ' is' : 's are'} `
-            + 'too shallow for a fin this way up. Tilt the part steeper so a fin can '
-            + 'follow it (try Suggest orientation), or add a wall by hand.');
+  // Full coverage (fins/fill.js): what it added, and -- must-see, in the panel --
+  // the red it couldn't reach, never hidden.
+  const fl = built.fill;
+  // What the walls leave bare (built.bare, fins/fill.js bareArea). Fins removed by
+  // hand held red too: measure again against the walls left (the build's own number
+  // would hide what the removal dropped). Hand-drawn walls aren't counted, so after
+  // one the line can only overstate what is bare.
+  let ba = built.bare;
+  if (ba && removedIds.size && topology && lastResult) {
+    ba = bareArea(topology, lastResult, rotM3.elements, ba,
+                  { fins: built.fins.filter((f) => !removedIds.has(f.id)) });
   }
-  if (built.skipped?.bore) {
-    // A support standing INSIDE a bore or slot scars a surface you can't clean --
-    // worse than a little sag. The tool refuses those on purpose; the honest fix
-    // is to rotate the hole so it faces out and prints clean with no support.
-    const b = built.skipped.bore;
-    help.push(`${b} overhang${b === 1 ? ' sits' : 's sit'} inside a bore or slot, `
-            + `where a support would leave a mark you can’t reach. The tool leaves `
-            + `${b === 1 ? 'it' : 'them'} alone, so turn the hole upward to print `
-            + `${b === 1 ? 'it' : 'them'} clean.`);
+  const pct = ba?.total ? Math.max(1, Math.round(100 * ba.area / ba.total)) : 0;
+  // More than half the red still bare, and not a few slivers: a figure, a mini, an
+  // organic shape. Fins hold the spine and the big overhangs there, not the rest
+  // (local issue 008's de-scope), and the user should hear that before printing.
+  // Not when nothing was placed ("none possible" says why), and in Auto not under a
+  // sparse slider: there the bare share is the slider's, not the shape's.
+  const mostlyBare = !!ba && n > 0 && ba.area >= MOSTLY_BARE.area && ba.area > MOSTLY_BARE.share * ba.total
+    && (fl || (built.bare.coverage ?? FIN.coverDefault) >= FIN.coverDefault);
+  if (fl) {
+    if (fl.walls) {
+      help.push(tn('Full coverage added {n} wall under overhangs Auto left bare.',
+                   'Full coverage added {n} walls under overhangs Auto left bare.', fl.walls));
+    } else if (fl.bareBefore < 1 && n) {
+      help.push(t('Auto already reaches every overhang here, so Full coverage added nothing.'));
+    }
+    const bare = Math.round(fl.unservedArea);
+    if (fl.capped) {
+      lead.push(t('Full coverage stopped at its wall limit with {area} mm² of overhang still bare — rotate the part, or add a wall by hand', { area: bare }));
+    } else if (bare >= 1 && !mostlyBare) {   // (else the figure warning below says it)
+      lead.push(t('{area} mm² of overhang no wall can reach this way up — tilt the part, or add a wall by hand', { area: bare }));
+    }
+  }
+  // Curved walls in Auto: the fill pass under the regions a forced curve won, and
+  // -- must-see, as in Full coverage -- the red there it couldn't reach
+  const cf = built.curvedFill;
+  if (cf) {
+    if (cf.walls) {
+      help.push(tn('Curved walls: added {n} wall under overhang the curves left bare.',
+                   'Curved walls: added {n} walls under overhang the curves left bare.', cf.walls));
+    }
+    const bare = Math.round(cf.unservedArea);
+    if (cf.capped) {
+      lead.push(t('Curved walls stopped at the wall limit with {area} mm² of overhang still bare — untick it, or switch to Full coverage', { area: bare }));
+    } else if (bare >= 1) {
+      lead.push(t('{area} mm² of overhang no wall can reach this way up — tilt the part, or add a wall by hand', { area: bare }));
+    }
+  }
+  // The figure warning in the panel: a build that holds under half of a figure
+  // mustn't read as done. Otherwise Auto's bare share is a fact behind the (i), not a
+  // warning: a tilted cube's strip past its end walls counts there and prints fine.
+  // Full says its own above; a curved fill's line covers only its regions.
+  if (mostlyBare) {
+    lead.push(fl
+      ? t('Lots of small or tucked-in overhang here ({pct} % still bare in Full coverage). For figures and minis, slicer tree supports often do better.', { pct })
+      : t('Lots of small or tucked-in overhang here ({pct} % bare). Try Full coverage; for figures and minis, slicer tree supports often do better.', { pct }));
+  } else if (ba && !fl && n && Math.round(ba.area) >= 1) {
+    help.push(t('Auto leaves {area} mm² ({pct} %) of overhang more than {reach} mm from a wall — Full coverage adds walls there',
+                { area: Math.round(ba.area), pct, reach: Math.round(fillReach(built.bare.coverage)) }));
+  }
+  // Curved walls in Full: the straight build held more, so it was kept
+  if (built.curvedDropped) {
+    help.push(t('Curved walls: Full coverage does better here with straight walls, so it kept them. Switch to Auto for the curves.'));
+  }
+  // (in Full coverage the fill's own line above says what is still bare)
+  if (built.unserved && !fl) {
+    help.push(tn('{n} overhang is too shallow for a fin this way up. Tilt the part steeper so a fin can '
+                 + 'follow it (try Suggest orientation), or add a wall by hand.',
+                 '{n} overhangs are too shallow for a fin this way up. Tilt the part steeper so a fin can '
+                 + 'follow it (try Suggest orientation), or add a wall by hand.', built.unserved));
+  }
+  if (built.smallHoleRegions) {
+    lead.push(tn('{n} small-hole ceiling left unsupported for bridging — check the slicer preview and print settings.',
+                 '{n} small-hole ceilings left unsupported for bridging — check the slicer preview and print settings.',
+                 built.smallHoleRegions));
+  }
+  // Plate only (#218) left these bare: say so, so the red isn't a mystery
+  const onPart = built.skipped?.onPart ?? 0;
+  if (onPart) {
+    help.push(tn('{n} support was cut short or left off because part of the model sits under '
+                 + 'the overhang and Plate only is on. Untick it to stand them on the part.',
+                 '{n} supports were cut short or left off because part of the model sits under '
+                 + 'the overhang and Plate only is on. Untick it to stand them on the part.', onPart));
   }
   // Sway braces were asked for, so say what they did -- and why, if nothing.
   if (sw) {
-    if (!sw.count) lead.push(`no sway braces: ${sw.reason}`);
+    if (!sw.count) lead.push(`${t('no sway braces')}: ${t(sw.reason)}`);
     else {
-      help.push('The sway braces stand edge-on against the tall sides and are tied on '
-        + 'by tines all the way up, so the top can’t drift or wobble as it prints.');
+      help.push(t('The sway braces stand edge-on against the tall sides and are tied on '
+        + 'by tines all the way up, so the top can’t drift or wobble as it prints.'));
       if (sw.skipped) {
-        help.push(`${sw.skipped} brace spot${sw.skipped === 1 ? ' was' : 's were'} blocked by `
-          + 'the part itself. Switch to Draw and click an upright side to place one by hand.');
+        help.push(tn('{n} brace spot was blocked by the part itself. Switch to Draw and click an upright side to place one by hand.',
+                     '{n} brace spots were blocked by the part itself. Switch to Draw and click an upright side to place one by hand.', sw.skipped));
       }
     }
   }
+  const iface = ifaceNote();
+  if (iface) lead.push(iface);
   setFinNote(lead, help);
   // ms is absent when a hand-drawn wall (Suggest + Draw mix) re-runs the readout
   // without rebuilding the auto fins -- don't touch the timing line then, and
   // never throw, or the updateReceipt() call after this one never happens.
-  if (ms != null) el('s-time').textContent = `${analysisTiming} · fins ${ms.toFixed(0)} ms`;
+  if (ms != null) el('s-time').textContent = `${analysisTiming} · ${t('fins')} ${ms.toFixed(0)} ms`;
 }
+
+window.addEventListener('languagechange', () => { if (lastBuilt) { syncAutoLabel(lastBuilt); updateReadout(lastBuilt, lastMs); } });

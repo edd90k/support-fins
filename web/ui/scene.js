@@ -7,14 +7,21 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import './pick.js';     // every Mesh raycast through a BVH (pointer picks on dense parts)
 import { el } from './dom.js';
+import { guardedCanvas } from './glguard.js';
+import { showGlFail, watchGl } from './glfail.js';
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 
 // ---------------------------------------------------------------- scene setup
 
 export const viewport = el('viewport');
-export const renderer = new THREE.WebGLRenderer({ antialias: true });
+// No WebGL at all: say so before the throw stops the page loading (#387).
+export const renderer = (() => {
+  try { return new THREE.WebGLRenderer({ antialias: true, canvas: guardedCanvas() }); }
+  catch (e) { showGlFail('start'); throw e; }
+})();
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 // Label the canvas: a screen reader otherwise announces a bare "canvas". The 3D
 // itself isn't reachable non-visually, but the live stats panel carries the same
@@ -24,6 +31,13 @@ renderer.domElement.setAttribute(
   'aria-label', 'Interactive 3D preview of the loaded part. Orientation and support '
   + 'stats are reported as text in the panel on the left.');
 viewport.appendChild(renderer.domElement);
+// Section view (section.js): the model materials share this array as their
+// clippingPlanes, so the cut is one push / clear. Guides and the plate never clip.
+renderer.localClippingEnabled = true;
+export const clip = [];
+// The model (part + every support mesh) also sits on this layer, so the section's
+// ghost pass can draw just the model again. The lights join it to light that pass.
+export const MODEL = 1;
 
 export const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x14161a);
@@ -50,6 +64,37 @@ scene.add(fill);
 const under = new THREE.DirectionalLight(0xffffff, 0.9);
 under.position.set(-0.35, 0.55, -1.2);
 scene.add(under);
+for (const l of scene.children) l.layers.enable(MODEL);
+
+// ---------------------------------------------------------- render on demand
+// The scene used to be drawn every frame, idle or not: with antialiasing at up to
+// 2x pixel ratio over a 1.56M-face part (and a big part's supports, millions more
+// triangles) that kept the GPU busy and the laptop warm while nothing moved. Now
+// app.js's tick draws while something may be changing -- any input on the page,
+// the orbit easing out (OrbitControls 'change' fires every frame its damping
+// moves), a mesh added or removed (which is how a worker build lands) -- for a
+// second after the last such sign, and otherwise only every IDLE_MS, so anything
+// that changes the scene some other way still shows within half a second.
+export const IDLE_MS = 500;
+let activeUntil = 0;
+/** Keep drawing every frame for the next `ms`. */
+export function requestRender(ms = 1000) {
+  activeUntil = Math.max(activeUntil, performance.now() + ms);
+}
+export const renderActive = (now) => now < activeUntil;
+for (const type of ['pointerdown', 'pointermove', 'pointerup', 'wheel', 'keydown', 'keyup',
+                    'input', 'change', 'click', 'resize', 'drop']) {
+  addEventListener(type, () => requestRender(), { capture: true, passive: true });
+}
+document.addEventListener('visibilitychange', () => requestRender());
+controls.addEventListener('change', () => requestRender());
+for (const k of ['add', 'remove']) {
+  const own = scene[k].bind(scene);
+  scene[k] = (...objects) => { requestRender(); return own(...objects); };
+}
+requestRender();   // startup
+// A lost context (driver reset) leaves the view black: show why, and redraw on restore.
+watchGl(renderer.domElement, () => requestRender());
 
 // ------------------------------------------------------------------ the plate
 
@@ -97,7 +142,10 @@ export function buildPlate(sx, sy, sz) {
 /** Point the camera at the part, backed off far enough to see all of it. */
 export function frame(size) {
   const reach = Math.max(size.x, size.y, size.z, 40);
-  const dist = reach * 2.1;
+  // The 45° field of view is vertical: a portrait phone sees far less across, so
+  // back off until the part fits the width too. Any window wider than tall (every
+  // desktop) keeps the old distance.
+  const dist = reach * 2.1 * Math.max(1, 0.7 / camera.aspect);
   camera.position.set(dist * 0.62, -dist * 0.72, dist * 0.55);
   camera.near = Math.max(0.5, reach / 200);
   camera.far = dist * 12;
@@ -106,8 +154,18 @@ export function frame(size) {
   controls.update();
 }
 
-/** Upload a triangle list into the scene, or null if there is nothing to show. */
-export function meshFrom(tris, material) {
+/** The interface crest's colour (prop/crest.js): the second material's part. */
+export const ifaceMaterial = new THREE.MeshStandardMaterial({
+  color: 0x9b6bff, roughness: 0.7, metalness: 0.0, side: THREE.DoubleSide,
+  clippingPlanes: clip,
+});
+
+/**
+ * Upload a triangle list into the scene, or null if there is nothing to show.
+ * Given `iface`, the interface crest's tagged triangles (v[3] === 1) draw in it:
+ * one geometry group per run, so a face index still addresses `tris` as before.
+ */
+export function meshFrom(tris, material, iface = null) {
   if (!tris.length) return null;
   const arr = new Float32Array(tris.length * 3);
   for (let i = 0; i < tris.length; i++) {
@@ -118,7 +176,19 @@ export function meshFrom(tris, material) {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
   g.computeVertexNormals();
-  const m = new THREE.Mesh(g, material);
+  let mat = material;
+  if (iface && tris.some((v) => v[3] === 1)) {
+    for (let i = 0; i < tris.length; ) {
+      const k = tris[i][3] === 1 ? 1 : 0;
+      let j = i + 3;
+      while (j < tris.length && (tris[j][3] === 1 ? 1 : 0) === k) j += 3;
+      g.addGroup(i, j - i, k);
+      i = j;
+    }
+    mat = [material, iface];
+  }
+  const m = new THREE.Mesh(g, mat);
+  m.layers.enable(MODEL);
   scene.add(m);
   return m;
 }

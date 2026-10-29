@@ -1,0 +1,99 @@
+{
+  "scene": {
+    "name": "stress-lbracket-x40",
+    "model": "lbracket",
+    "rot": [
+      40,
+      0,
+      0
+    ]
+  },
+  "walls": 5,
+  "tines": 28,
+  "unserved": 0,
+  "triangles": 2476,
+  "padTriangles": 38258,
+  "fins": [
+    {
+      "kind": "prop",
+      "height": 31.266,
+      "length": 36.523,
+      "tines": 0,
+      "from": [
+        -23.5,
+        27.991,
+        31.266
+      ],
+      "to": [
+        -23.5,
+        -8.532,
+        0.62
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 31.266,
+      "length": 36.523,
+      "tines": 0,
+      "from": [
+        -11.5,
+        27.991,
+        31.266
+      ],
+      "to": [
+        -11.5,
+        -8.532,
+        0.62
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 8.611,
+      "length": 9.523,
+      "tines": 0,
+      "from": [
+        -0.5,
+        0.991,
+        8.611
+      ],
+      "to": [
+        -0.5,
+        -8.532,
+        0.62
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 8.611,
+      "length": 9.523,
+      "tines": 0,
+      "from": [
+        11.5,
+        0.991,
+        8.611
+      ],
+      "to": [
+        11.5,
+        -8.532,
+        0.62
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 8.611,
+      "length": 9.523,
+      "tines": 0,
+      "from": [
+        23.5,
+        0.991,
+        8.611
+      ],
+      "to": [
+        23.5,
+        -8.532,
+        0.62
+      ]
+    }
+  ],
+  "sha256": "cd14c3de59b2d9865e02c9e57e0c53b4e03d5cd9355396e82f788ced9d8f4caa"
+}

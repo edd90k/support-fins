@@ -1,10 +1,11 @@
+import { t } from './i18n.js';
 /**
  * Build volume: the preset/custom select, the remembered choice, and the plate
  * it draws. updateFit() reads the live size through currentVolume().
  */
 import { el } from './dom.js';
 import { buildPlate } from './scene.js';
-import { part, shade } from '../app.js';
+import { part, shade } from './part.js';
 
 /**
  * Build volumes are listed by DIMENSION, never by printer name. This ships to
@@ -29,7 +30,7 @@ const customRow = el('custom-vol');
 const customInputs = ['vx', 'vy', 'vz'].map(el);
 
 for (const v of VOLUMES) volumeSelect.add(new Option(volLabel(v), volLabel(v)));
-volumeSelect.add(new Option('Custom…', 'custom'));
+volumeSelect.add(new Option(t('Custom…'), 'custom'));
 
 let volume = { ...DEFAULT_VOLUME };
 try {
@@ -50,6 +51,7 @@ export function applyVolume() {
     localStorage.setItem(VOLUME_STORE, JSON.stringify(volume));
   } catch { /* private mode; the app still works, it just forgets */ }
   if (part) shade();
+  document.dispatchEvent(new Event('buildvolumechange'));   // the plates' row (ui/plates.js)
 }
 
 volumeSelect.addEventListener('change', () => {
@@ -68,3 +70,5 @@ for (const inp of customInputs) {
     if (x > 0 && y > 0 && z > 0) { volume = { x, y, z }; applyVolume(); }
   });
 }
+
+window.addEventListener('languagechange', () => { if (typeof updateFit === 'function') updateFit(); });

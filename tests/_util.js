@@ -2,13 +2,18 @@
 // --allow-read tests/` runs offline. The support engine is pure geometry, so
 // every test is: build some geometry, assert an invariant on the triangle soup.
 
-export const WEB = new URL('../web/', import.meta.url).pathname;
-export const MODELS = new URL('../prototype/stress/models/', import.meta.url).pathname;
+import { fileURLToPath } from 'node:url';
+
+// WEB is used in import(): keep it a URL string. MODELS is read from disk: make it a
+// filesystem path. URL.pathname is neither on Windows (leading slash, %20 for spaces).
+export const WEB = new URL('../web/', import.meta.url).href;
+export const MODELS = fileURLToPath(new URL('../prototype/stress/models/', import.meta.url));
 
 export const { buildTopology, analyze } = await import(`${WEB}overhangs.js`);
 export const fins = await import(`${WEB}fins.js`);
 export const prop = await import(`${WEB}prop.js`);
 export const { insidePart } = await import(`${WEB}inside.js`);
+export const { readSTL } = await import(`${WEB}stl.js`);
 
 // --- assertions -----------------------------------------------------------
 export function assert(cond, msg) {
@@ -19,17 +24,6 @@ export function assertClose(a, b, tol, msg) {
 }
 
 // --- STL + geometry --------------------------------------------------------
-export function readSTL(bytes) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const n = dv.getUint32(80, true);
-  const pos = new Float32Array(n * 9);
-  for (let f = 0; f < n; f++) {
-    const o = 84 + f * 50 + 12;
-    for (let i = 0; i < 9; i++) pos[f * 9 + i] = dv.getFloat32(o + i * 4, true);
-  }
-  return pos;
-}
-
 export function loadModel(name) {
   const pos = readSTL(Deno.readFileSync(`${MODELS}${name}.stl`));
   return buildTopology({ getAttribute: (k) => (k === 'position' ? { array: pos } : null) });
@@ -125,6 +119,27 @@ export function isClosed(tris) {
   return true;
 }
 
+/** Every edge is walked once each way (no face flipped against its neighbour) and
+ *  the enclosed volume is positive (normals point out). isClosed only counts edges,
+ *  so it passes a mesh with a patch wound inside-out -- one a slicer misreads. */
+export function isOriented(tris) {
+  const key = (p) => `${Math.round(p[0] * 1e3)},${Math.round(p[1] * 1e3)},${Math.round(p[2] * 1e3)}`;
+  const edges = new Map();
+  let vol = 0;
+  for (let i = 0; i < tris.length; i += 3) {
+    const [p, q, r] = [tris[i], tris[i + 1], tris[i + 2]];
+    vol += p[0] * (q[1] * r[2] - q[2] * r[1]) - p[1] * (q[0] * r[2] - q[2] * r[0]) + p[2] * (q[0] * r[1] - q[1] * r[0]);
+    for (let e = 0; e < 3; e++) {
+      const a = key(tris[i + e]), b = key(tris[i + (e + 1) % 3]);
+      if (a === b) continue;
+      const k = a < b ? `${a}|${b}` : `${b}|${a}`;
+      edges.set(k, (edges.get(k) ?? 0) + (a < b ? 1 : -1));
+    }
+  }
+  for (const c of edges.values()) if (c !== 0) return false;
+  return vol > 0;
+}
+
 /** Squared distance from point p to triangle (a,b,c) (each [x,y,z]). */
 export function ptTriDist2(p, a, b, c) {
   const sub = (u, v) => [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
@@ -174,4 +189,27 @@ export function bbox(tris) {
   const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (const v of tris) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], v[k]); hi[k] = Math.max(hi[k], v[k]); }
   return { lo, hi };
+}
+
+/** Split emitTines output into its boxes: each tine is a 36-vertex block, followed by
+ *  its WALL STEP (another 36) when the tine sits above the wall top (local issue 005).
+ *  A step starts below its tine, ends inside it and lies inside its footprint, which a
+ *  next tine along the run never does. Returns { tines, steps } of
+ *  { verts, lo, hi } (a step also carries `tine`, the box it sits under). */
+export function tineBoxes(out) {
+  const tines = [], steps = [];
+  const within = (b, t) => [0, 1].every((k) => b.lo[k] >= t.lo[k] - 1e-6 && b.hi[k] <= t.hi[k] + 1e-6);
+  let prev = null;
+  for (let i = 0; i + 36 <= out.length; i += 36) {
+    const verts = out.slice(i, i + 36);
+    const b = { verts, ...bbox(verts) };
+    if (prev && b.lo[2] < prev.lo[2] && b.hi[2] > prev.lo[2] && b.hi[2] < prev.hi[2] && within(b, prev)) {
+      steps.push({ ...b, tine: prev });
+      prev = null;                              // at most one step per tine
+    } else {
+      tines.push(b);
+      prev = b;
+    }
+  }
+  return { tines, steps };
 }

@@ -45,55 +45,6 @@ def rot_x(deg, shift=(0, 0, 0), scale=1.0):
     return m
 
 
-def loops_area(groups):
-    return sum(abs(SF.signed_area(o)) - sum(abs(SF.signed_area(h)) for h in hs) for o, hs in groups)
-
-
-# ------------------------------------------------------------------ slicing core
-def test_cube_cross_section_is_one_square():
-    box = trimesh.creation.box((10, 20, 30))
-    box.apply_translation([0, 0, 15])
-    loops = SF.slice_soup(np.asarray(box.triangles), 7.3)
-    assert len(loops) == 1
-    assert abs(abs(SF.signed_area(loops[0])) - 200.0) < 1e-9
-
-
-def test_hole_is_grouped_under_its_outer():
-    tube = trimesh.creation.annulus(r_min=4, r_max=10, height=20, sections=64)
-    tube.apply_translation([0, 0, 10])
-    groups = SF.group_loops(SF.slice_soup(np.asarray(tube.triangles), 10.1))
-    assert len(groups) == 1 and len(groups[0][1]) == 1
-    ring = tube.section(plane_origin=[0, 0, 10.1], plane_normal=[0, 0, 1]).to_2D()[0].area
-    assert abs(loops_area(groups) - ring) / ring < 1e-9
-
-
-def test_winding_is_not_trusted():
-    box = trimesh.creation.box((10, 10, 10))
-    box.apply_translation([0, 0, 5])
-    flipped = np.asarray(box.triangles)[:, ::-1, :]  # every face inside-out
-    groups = SF.group_loops(SF.slice_soup(flipped, 5.0))
-    assert len(groups) == 1 and abs(loops_area(groups) - 100.0) < 1e-9
-
-
-def test_face_exactly_on_the_plane_counts_as_inside_like_orca():
-    # Orca puts a layer whose slice plane touches a top face INSIDE the solid
-    # (verified against a real Orca 2.5 slice of a finned STL in an Orca 2.5 nightly).
-    box = trimesh.creation.box((10, 10, 10))
-    box.apply_translation([0, 0, 5])
-    top = SF.slice_soup(np.asarray(box.triangles), 10.0)                 # top face ON the plane
-    assert len(top) == 1 and abs(abs(SF.signed_area(top[0])) - 100.0) < 1e-5
-    assert SF.slice_soup(np.asarray(box.triangles), 0.0) == []           # bottom face ON the plane
-
-
-def test_overlapping_solids_split_into_shells():
-    a = trimesh.creation.box((10, 10, 10))
-    b = trimesh.creation.box((10, 10, 10))
-    b.apply_translation([5, 0, 0])            # overlaps a, shares no edges
-    soup = np.concatenate([a.triangles, b.triangles])
-    shells = SF.split_shells(soup)
-    assert sorted(len(s) for s in shells) == [12, 12]
-
-
 # ------------------------------------------------------------------ frame
 def test_slice_frame_round_trip_and_refusal():
     f = SF.SliceFrame(np.array([100.0, 50.0]), np.array([140.0, 70.0]),
@@ -131,26 +82,30 @@ def _weld(tris):
     return V, inv.reshape(-1, 3)
 
 
-def run_case(model, trafo, layer_height=0.2):
+def run_case(model, trafo, layer_height=0.2, config=None):
     part = trimesh.load(MODELS / f"{model}.stl")
     po = fake_orca.FakePrintObject(part, trafo, layer_height=layer_height)
     # the fins the plugin will compute, in the same centred frame as po.posed
     soup = SF.posed_part_soup(po)
     soup = soup - np.array([po.center_mm[0], po.center_mm[1], soup[:, :, 2].min()])
-    fins, stats = SF.compute_fins(soup, layer_height, dict(SF._DEFAULTS))
+    fins, stats = SF.compute_fins(soup, layer_height, {**SF._DEFAULTS, **(config or {})})
     want = expected_islands(po, fins)
     cap = SF.SupportFinsSlicing()
+    cap._config = json.dumps(config or {})
     res = cap.execute(fake_orca.Ctx(po))
     return po, res, want, stats
 
 
-@pytest.mark.parametrize("model,deg,shift,scale", [
-    ("cube", 45, (137.25, 88.5, 12.0), 1.0),     # parked off-centre, lifted
-    ("wedge", 45, (40.0, 200.0, 0.0), 1.0),
-    ("ramp", 45, (-30.0, 5.0, 0.0), 1.004),      # with XY/Z shrinkage compensation
+@pytest.mark.parametrize("model,deg,shift,scale,config", [
+    ("cube", 45, (137.25, 88.5, 12.0), 1.0, None),     # parked off-centre, lifted
+    ("wedge", 45, (40.0, 200.0, 0.0), 1.0, None),
+    ("ramp", 45, (-30.0, 5.0, 0.0), 1.004, None),      # with XY/Z shrinkage compensation
+    # Full coverage: its mixed squat/full walls once met face on face, and the oracle
+    # (trimesh reads topology) lost their section on the low layers (local issue 057)
+    ("lbracket", 40, (20.0, -15.0, 0.0), 1.0, {"mode": "full"}),
 ])
-def test_fins_land_exactly_where_a_finned_stl_would(model, deg, shift, scale):
-    po, res, want, stats = run_case(model, rot_x(deg, shift, scale))
+def test_fins_land_exactly_where_a_finned_stl_would(model, deg, shift, scale, config):
+    po, res, want, stats = run_case(model, rot_x(deg, shift, scale), config=config)
     assert res.status is fake_orca.PluginResult.Success, res
     assert stats["braces"] >= 1
     worst, total_fin = 0.0, 0.0
@@ -160,7 +115,27 @@ def test_fins_land_exactly_where_a_finned_stl_would(model, deg, shift, scale):
         worst = max(worst, diff)
     # tolerance: slicer vertex rounding (1 nm) and chord differences, per layer
     assert worst < 0.05, f"{res.message}: worst per-layer mismatch {worst:.4f} mm^2"
-    assert "fin(s)" in res.message
+    assert " walls, " in res.message or " wall, " in res.message
+
+
+def test_no_fins_still_reports_overhangs_left_bare(monkeypatch):
+    # The torus case: nothing placed, but 2 overhangs too shallow -- never "no fins needed".
+    part = trimesh.load(MODELS / "cube.stl")
+    po = fake_orca.FakePrintObject(part, rot_x(45, (50, 50, 0)))
+    monkeypatch.setattr(SF, "compute_fins", lambda *a: (np.zeros((0, 3, 3)), {"unserved": 2}))
+    assert "2 overhangs are too shallow" in SF.inject_fins(po, dict(SF._DEFAULTS), 0.2, 1e-6)
+    monkeypatch.setattr(SF, "compute_fins", lambda *a: (np.zeros((0, 3, 3)), {"smallHoleRegions": 1}))
+    assert "1 small-hole ceiling left unsupported for bridging" in SF.inject_fins(po, dict(SF._DEFAULTS), 0.2, 1e-6)
+    monkeypatch.setattr(SF, "compute_fins", lambda *a: (np.zeros((0, 3, 3)), {}))
+    assert SF.inject_fins(po, dict(SF._DEFAULTS), 0.2, 1e-6) == "no fins needed"
+
+
+def test_fins_that_reach_no_layer_are_not_reported_as_added(monkeypatch):
+    part = trimesh.load(MODELS / "cube.stl")
+    po = fake_orca.FakePrintObject(part, rot_x(45, (50, 50, 0)))
+    far = np.array([[[0, 0, 900.0], [1, 0, 900.0], [0, 1, 901.0]]])   # above every layer
+    monkeypatch.setattr(SF, "compute_fins", lambda *a: (far, {"braces": 1, "tines": 2}))
+    assert "nothing was added" in SF.inject_fins(po, dict(SF._DEFAULTS), 0.2, 1e-6)
 
 
 def test_fins_actually_add_material_under_the_overhang():
@@ -237,3 +212,113 @@ def test_mirrored_part_gets_the_same_fins_as_its_twin():
     _, s_ref = SF.compute_fins(SF.posed_part_soup(ref), 0.2, dict(SF._DEFAULTS))
     assert s_ref["braces"] >= 1
     assert (s_mir["braces"], s_mir["tines"]) == (s_ref["braces"], s_ref["tines"])
+
+
+# ------------------------------------------------------------------ config
+def _fin_area(config, model="lbracket", deg=40):
+    po = fake_orca.FakePrintObject(trimesh.load(MODELS / f"{model}.stl"), rot_x(deg))
+    before = sum(L.islands().area for L in po.layers())
+    cap = SF.SupportFinsSlicing()
+    cap._config = json.dumps(config)
+    res = cap.execute(fake_orca.Ctx(po))
+    return sum(L.islands().area for L in po.layers()) - before, res
+
+
+def test_every_engine_setting_is_a_config_key():
+    # every options.json setting but Orca's own layer height is taken, as Orca stores
+    # the config (a JSON string); written out at its default it builds what leaving it
+    # out builds
+    ctx = SF._engine_ctx()
+    every = {o["key"]: o["default"] for o in SF.host_schema(ctx)["options"]
+             if o.get("hostSupplied") != "slicer"}
+    assert {"mode", "gap", "threshold", "padStyle", "cutout", "sway.on"} <= set(every)
+    assert _fin_area(json.loads(json.dumps(every)))[0] == _fin_area({})[0] > 0
+
+
+def test_the_default_config_is_the_plugins_own_keys_only():
+    # Orca's Restore defaults writes this back as the stored config: every setting in
+    # it would pin those users to today's defaults when the site's change
+    assert SF.SupportFinsSlicing().get_default_config() == {"enabled": True, "apply_to": "no-supports"}
+
+
+def test_hand_written_values_read_as_before():
+    ctx = SF._engine_ctx()
+    want = SF.engine_options(ctx, {"coverage": 0.5, "tines": False}, 0.2)
+    for cfg in ({"coverage": "0.5", "tines": "false"}, {"coverage": 0.5, "tines": 0}, {"coverage": 0.5, "tines": "0"}):
+        assert SF.engine_options(ctx, cfg, 0.2) == want, cfg
+    assert SF.engine_options(ctx, {"tines": 1}, 0.2)["tines"] is True
+    # a config that says it's off is off, string or not
+    po = fake_orca.FakePrintObject(trimesh.load(MODELS / "cube.stl"), rot_x(45))
+    cap = SF.SupportFinsSlicing()
+    cap._config = json.dumps({"enabled": "false"})
+    assert "disabled" in cap.execute(fake_orca.Ctx(po)).message
+
+
+def test_an_old_saved_config_builds_the_fins_it_always_did():
+    # main's compute_fins sent exactly these options for the old default config
+    old = {"enabled": True, "apply_to": "no-supports", "coverage": 0.5, "tines": True,
+           "tine_density": 0.0, "bed_pad": True}
+    po = fake_orca.FakePrintObject(trimesh.load(MODELS / "lbracket.stl"), rot_x(40))
+    soup = SF.posed_part_soup(po)
+    then = SF.host_compute(SF._engine_ctx(), soup, {"mode": "auto", "bedPad": True, "tines": True,
+                                                    "tineDensity": 0.0, "coverage": 0.5, "layerHeight": 0.2})[0]
+    now = SF.compute_fins(soup, 0.2, old)[0]
+    assert then.shape == now.shape and np.array_equal(then, now)
+
+
+def test_older_config_names_still_work():
+    ctx = SF._engine_ctx()
+    old = {"enabled": True, "apply_to": "all", "coverage": 0.25, "tines": True,
+           "tine_density": 0.4, "bed_pad": False}
+    assert SF.engine_options(ctx, old, 0.16) == SF.engine_options(
+        ctx, {"coverage": 0.25, "tines": True, "tineDensity": 0.4, "padStyle": "off"}, 0.16)
+    # bed_pad true leaves the pad style alone
+    assert SF.engine_options(ctx, {"bed_pad": True, "padStyle": "sure"}, 0.2)["padStyle"] == "sure"
+
+
+def test_full_coverage_from_the_config_adds_walls():
+    # the staircase at X40: Auto leaves its treads' edges red (the lbracket's are held
+    # by Auto's flush end walls since #269, so Full had nothing left to add there)
+    auto, _ = _fin_area({}, model="staircase")
+    full, res = _fin_area({"mode": "full"}, model="staircase")
+    assert full > auto * 1.2, f"Full {full:.0f} vs Auto {auto:.0f} mm2 of fin cross-section"
+    assert "walls" in res.message
+
+
+def test_a_bad_key_or_value_fails_the_slice_by_name():
+    for config, want in (({"sparkle": 1}, "sparkle"), ({"mode": "draw"}, "mode"),
+                         ({"gap": 3}, "gap"), ({"layerHeight": 0.1}, "Orca's own layer height"),
+                         ({"nozzle": "0.8"}, "Orca's own nozzle")):
+        _, res = _fin_area(config)
+        assert res.status is fake_orca.PluginResult.RecoverableError and want in res.message, res.message
+        assert "ValueError" not in res.message, res.message
+
+
+class _Cfg:
+    def __init__(self, **kv):
+        self.kv = kv
+
+    def config_value(self, key):
+        return self.kv.get(key)
+
+
+@pytest.mark.parametrize("cfg,want", [
+    ({}, None),                                                   # Orca doesn't say: engine's 0.4
+    ({"nozzle_diameter": "0.6"}, 0.6),
+    ({"nozzle_diameter": "0.4,0.8", "wall_filament": "2"}, 0.8),  # the wall extruder's
+    ({"nozzle_diameter": [0.4, 0.8], "wall_filament": "9"}, 0.8), # past the list: the last
+    ({"nozzle_diameter": "junk"}, None),
+])
+def test_nozzle_comes_from_orcas_printer_settings(cfg, want):
+    assert SF._nozzle(_Cfg(**cfg)) == want
+
+
+def test_the_nozzle_reaches_the_engine():
+    po = fake_orca.FakePrintObject(trimesh.load(MODELS / "cube.stl"), rot_x(45))
+    soup = SF.posed_part_soup(po)
+    soup = soup - np.array([0.0, 0.0, soup[:, :, 2].min()])
+    default, _ = SF.compute_fins(soup, 0.2, dict(SF._DEFAULTS))
+    same, _ = SF.compute_fins(soup, 0.2, dict(SF._DEFAULTS), 0.4)
+    wide, _ = SF.compute_fins(soup, 0.2, dict(SF._DEFAULTS), 0.8)
+    assert np.array_equal(default, same)
+    assert default.shape != wide.shape or not np.allclose(default, wide)

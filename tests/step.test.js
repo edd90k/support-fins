@@ -13,16 +13,14 @@
 // with a flat 25 mm ledge and an 8 mm bore through base and ledge, and the same
 // bracket next to a separate 10 mm peg.
 
-import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { loadOcct } from './_occt.js';
 import { WEB, fins, buildTopology, analyze, rotX, isClosed, assert, assertClose } from './_util.js';
 
 const { isStep, stepObjects, STEP_PARAMS } = await import(`${WEB}step.js`);
 
-const FIX = new URL('./fixtures/', import.meta.url).pathname;
-const OCCT = `${WEB}vendor/occt-import-js-0.0.23/`;
-
-const occtimportjs = createRequire(import.meta.url)(`${OCCT}occt-import-js.js`);
-const occt = await occtimportjs({ wasmBinary: Deno.readFileSync(`${OCCT}occt-import-js.wasm`) });
+const FIX = fileURLToPath(new URL('./fixtures/', import.meta.url));
+const occt = await loadOcct();
 
 const readFixture = (name) =>
   stepObjects(occt.ReadStepFile(Deno.readFileSync(`${FIX}${name}`), STEP_PARAMS));

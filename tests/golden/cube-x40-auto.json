@@ -1,0 +1,83 @@
+{
+  "scene": {
+    "name": "cube-x40-auto",
+    "model": "cube",
+    "rot": [
+      40,
+      0,
+      0
+    ]
+  },
+  "walls": 4,
+  "tines": 24,
+  "unserved": 0,
+  "triangles": 2816,
+  "padTriangles": 30632,
+  "fins": [
+    {
+      "kind": "prop",
+      "height": 25.512,
+      "length": 29.665,
+      "tines": 0,
+      "from": [
+        19.4,
+        -1.488,
+        0.62
+      ],
+      "to": [
+        19.4,
+        28.177,
+        25.512
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 25.512,
+      "length": 29.665,
+      "tines": 0,
+      "from": [
+        6.467,
+        -1.488,
+        0.62
+      ],
+      "to": [
+        6.467,
+        28.177,
+        25.512
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 25.512,
+      "length": 29.665,
+      "tines": 0,
+      "from": [
+        -6.467,
+        -1.488,
+        0.62
+      ],
+      "to": [
+        -6.467,
+        28.177,
+        25.512
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 25.512,
+      "length": 29.665,
+      "tines": 0,
+      "from": [
+        -19.4,
+        -1.488,
+        0.62
+      ],
+      "to": [
+        -19.4,
+        28.177,
+        25.512
+      ]
+    }
+  ],
+  "sha256": "89bcceaf4b22f9f8dfb7ec3764962d4b71526c8aca70dfcd567b2527f7d27eab"
+}

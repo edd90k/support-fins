@@ -6,7 +6,7 @@
 # name = "Support Fins"
 # description = "Adds printfins.com breakaway support fins under overhangs at slice time. Parts with Orca supports turned on are left alone."
 # author = "Matthew Trahan (engine), J (Orca plugin)"
-# version = "0.1.0"
+# version = "0.7.0"
 # type = "slicing-pipeline"
 # ///
 """Support Fins for OrcaSlicer -- fins added at slice time.
@@ -43,8 +43,6 @@ LIMITS (spike)
   * The slicing-pipeline API is marked research/experimental by Orca.
   * One fin set per print object (all instances of an object share it).
 """
-import atexit
-import base64
 import json
 import os
 import time
@@ -57,20 +55,28 @@ except ImportError:  # pragma: no cover - surfaced to the user in execute()
     np = None
 
 ENGINE_JS = "__FINS_ENGINE_JS__"   # replaced by build.py with the esbuild bundle
+VERSION = "0.7.0"   # stamped by build.py (plugins/shared/version.py), as the header's
 
+# The plugin's own config keys, and its whole default config: Orca's "Restore defaults"
+# writes this back as the stored config, so a default listing every setting would pin
+# those users to today's defaults for good. Every other key is a setting from options.json, the
+# schema every plugin dialog is built from (mode, gap, threshold, padStyle, cutout,
+# sway.on, ...), in the engine's units: a percent setting is value / 100, as
+# coverage 0.5 always was here. They go to the engine through host_options, which
+# checks each one, so a typo or a bad value fails the slice with the engine's own
+# message rather than quietly printing default fins.
 _DEFAULTS = {
     "enabled": True,
     "apply_to": "no-supports",   # "no-supports" | "all"
-    "coverage": 0.5,             # 0..1, website slider default
-    "tines": True,
-    "tine_density": 0.0,         # 0..1, website slider default
-    "bed_pad": True,
 }
+# Older configs' names: tine_density is tineDensity; bed_pad false is padStyle "off".
+_ALIASES = {"tine_density": "tineDensity"}
 
 # ---------------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------------
-_engine = None
+# host_engine() starts V8 with the bundle, host_compute() runs it on a soup
+# __SUPPORTFINS_HOST__ (build.py inlines plugins/shared/py/supportfins_host.py here)
 
 
 def _engine_ctx():
@@ -78,215 +84,91 @@ def _engine_ctx():
 
     Started at module load (see the bottom of this section), because Orca's audit
     hook is off while plugins load but gates every file open during slicing, and V8
-    reads its ICU data file when it starts. On macOS V8 runs --jitless: mini-racer's
-    JIT hits SIGTRAP there, and a hardened app may refuse JIT memory anyway. Both
-    are lessons from gittrahan's feat/orca-plugin branch.
+    reads its ICU data file when it starts.
     """
-    global _engine
-    if _engine is None:
-        import sys
-        from py_mini_racer import MiniRacer, init_mini_racer
-        if ENGINE_JS.startswith("__FINS_ENGINE"):
-            raise RuntimeError("fin engine bundle missing -- run plugins/orca/build.py")
-        flags = ["--single-threaded"]
-        if sys.platform == "darwin":
-            flags.append("--jitless")
-        init_mini_racer(flags=flags, ignore_duplicate_init=True)
-        ctx = MiniRacer()
-        ctx.eval(ENGINE_JS)
-        # mini-racer never tears V8 down by itself: without an explicit close(), the
-        # interpreter hangs forever at exit (seen in pytest on macOS, any V8 flags).
-        atexit.register(ctx.close)
-        _engine = ctx
-    return _engine
+    if ENGINE_JS.startswith("__FINS_ENGINE"):
+        raise RuntimeError("fin engine bundle missing -- run plugins/orca/build.py")
+    return host_engine(ENGINE_JS)
 
 
 if not ENGINE_JS.startswith("__FINS_ENGINE"):
     try:
         _engine_ctx()
     except Exception:  # pragma: no cover - retried (and reported) on first slice
-        _engine = None
+        pass
 
 
-def compute_fins(soup, layer_height, cfg):
+def compute_fins(soup, layer_height, cfg, nozzle=None):
     """Run the printfins.com engine on a posed part.
 
     soup: (M,3,3) float64 triangles, mm, in whatever frame the caller likes.
+    nozzle: the part's nozzle diameter (mm), which sizes the walls and tines; None = 0.4.
     Returns (fins (K,3,3) float64 in the SAME frame as `soup`, stats dict).
     """
-    soup = np.ascontiguousarray(soup, dtype=np.float64)
-    opts = {
-        "mode": "auto",
-        "bedPad": bool(cfg["bed_pad"]),
-        "tines": bool(cfg["tines"]),
-        "tineDensity": float(cfg["tine_density"]),
-        "coverage": float(cfg["coverage"]),
-        "layerHeight": float(layer_height),
-    }
-    raw = _engine_ctx().call(
-        "SupportFinsEngine.computeFinsB64",
-        base64.b64encode(soup.tobytes()).decode("ascii"),
-        json.dumps(opts),
-    )
-    out = json.loads(raw)
-    seated = np.frombuffer(base64.b64decode(out["triangles"]), dtype=np.float32)
-    seated = seated.astype(np.float64).reshape(-1, 3, 3)
-    off = out["offset"]  # seated = input + offset
-    fins = seated - np.array([off["x"], off["y"], off["z"]], dtype=np.float64)
-    return fins, out["stats"]
+    ctx = _engine_ctx()
+    return host_compute(ctx, soup, engine_options(ctx, cfg, layer_height, nozzle))
+
+
+def engine_options(ctx, cfg, layer_height, nozzle=None):
+    """The plugin config -> checked engine options (raises ValueError on a bad key or
+    value). Layer height and nozzle are always the slice's own (options.json
+    hostSupplied); a nozzle of None leaves the engine's 0.4."""
+    values = {k: v for k, v in cfg.items() if k not in _DEFAULTS}
+    # hand-written JSON says 1 / 0 (or "1" / "0") for on / off
+    for o in host_schema(ctx)["options"]:
+        v = values.get(o["key"])
+        if o["type"] == "bool" and not isinstance(v, bool) and str(v).strip() in ("0", "1"):
+            values[o["key"]] = str(v).strip() == "1"
+    for old, new in _ALIASES.items():
+        if old in values:
+            values.setdefault(new, values[old])
+            del values[old]
+    bed_pad = values.pop("bed_pad", True)
+    if bed_pad is False or str(bed_pad).strip().lower() in ("0", "false", "no", "off"):
+        values.setdefault("padStyle", "off")
+    if "layerHeight" in values:
+        raise ValueError("layerHeight is Orca's own layer height: remove it from the plugin config")
+    values["layerHeight"] = float(layer_height)
+    if "nozzle" in values:
+        raise ValueError("nozzle is Orca's own nozzle diameter: remove it from the plugin config")
+    if nozzle:
+        values["nozzle"] = float(nozzle)
+    return host_options(ctx, values)
+
+
+def _nozzle(print_object, ctx=None):
+    """The nozzle (mm) that prints this object's walls, from Orca's printer settings
+    ("0.4,0.6" or a list, one per extruder; wall_filament picks, 1-based). None
+    when Orca doesn't say, which keeps the engine's 0.4."""
+    def val(key):
+        for src in (print_object, ctx):
+            try:
+                v = src.config_value(key) if src is not None else None
+            except Exception:
+                v = None
+            if v not in (None, ""):
+                return v
+        return None
+    raw = val("nozzle_diameter")
+    if raw is None:
+        return None
+    sizes = list(raw) if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    try:
+        sizes = [float(s) for s in sizes]
+        idx = max(0, int(val("wall_filament") or 1) - 1)
+    except (TypeError, ValueError):
+        return None
+    if not sizes:
+        return None
+    size = sizes[min(idx, len(sizes) - 1)]
+    return size if size > 0 else None
 
 
 # ---------------------------------------------------------------------------------
-# Mesh -> per-layer polygons (pure numpy; no Orca types)
+# Mesh -> per-layer polygons
 # ---------------------------------------------------------------------------------
-# The engine emits fins as SEPARATE closed solids (wall, tines, pad) that overlap on
-# purpose -- "the slicer unions them". So: split the soup into its closed shells,
-# cross-section each shell on its own (where loop nesting is well defined), and let
-# Orca's own union (ExPolygon.union_ex) merge shells with each other and with the part.
-# Winding is never trusted: outer vs hole comes from nesting depth, and Orca's
-# ExPolygon constructor normalises orientation itself.
-
-def _vkey(v, quantum=1e-4):
-    return np.round(v / quantum).astype(np.int64)
-
-
-def split_shells(tris):
-    """Closed shells of a triangle soup: triangles are in the same shell when they
-    share an EDGE. Two solids that merely touch at a vertex (a tine tip on a wall
-    corner, say) stay separate, which keeps each shell's cross-section nesting sane."""
-    n = len(tris)
-    if n == 0:
-        return []
-    _, vid = np.unique(_vkey(tris.reshape(-1, 3)), axis=0, return_inverse=True)
-    vid = vid.reshape(n, 3)
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    owner = {}
-    for f, (a, b, c) in enumerate(vid):
-        for u, v in ((a, b), (b, c), (c, a)):
-            e = (u, v) if u < v else (v, u)
-            g = owner.setdefault(e, f)
-            if g != f:
-                ra, rb = find(f), find(g)
-                if ra != rb:
-                    parent[rb] = ra
-    roots = np.array([find(f) for f in range(n)])
-    return [tris[roots == r] for r in np.unique(roots)]
-
-
-PLANE_NUDGE = -1e-7  # mm
-
-
-def slice_soup(tris, z, quantum=1e-6):
-    """Cross-section ONE closed shell with the plane Z = z -> list of closed loops,
-    each an (N,2) float64 array (orientation unspecified).
-
-    The plane is nudged DOWN by 1e-7 mm so no vertex ever lies exactly on it. It
-    matters: the engine sizes the bed pad to the layer height, so the pad's top face
-    can land exactly on a layer's slice_z, and a face ON the plane is ambiguous
-    (half the layer is pad). Orca's own slicer puts that layer INSIDE the solid --
-    measured in an Orca 2.5 nightly: lbracket's pad top sits at z = 0.5 = slice_z of layer 3,
-    and a finned STL sliced by Orca prints pad there. Nudging down gives the same
-    answer, so the plugin's layers match a finned STL exactly."""
-    if len(tris) == 0:
-        return []
-    z = z + PLANE_NUDGE
-    zs = tris[:, :, 2]
-    sel = (zs.min(axis=1) <= z) & (zs.max(axis=1) >= z)
-    if not np.any(sel):
-        return []
-    t = tris[sel]
-    above = (t[:, :, 2] - z) >= 0.0
-    n_above = above.sum(axis=1)
-    keep = (n_above == 1) | (n_above == 2)
-    t, above = t[keep], above[keep]
-    if len(t) == 0:
-        return []
-    d = t[:, :, 2] - z
-    segs = []
-    for p, dk, ab in zip(t, d, above):
-        lone = int(np.nonzero(ab if ab.sum() == 1 else ~ab)[0][0])
-        a, b = (lone + 1) % 3, (lone + 2) % 3
-        segs.append((_edge_cross(p[lone], p[a], dk[lone], dk[a]),
-                     _edge_cross(p[lone], p[b], dk[lone], dk[b])))
-    return _chain(segs, quantum)
-
-
-def _edge_cross(p0, p1, d0, d1):
-    s = d0 / (d0 - d1)
-    return (p0 + s * (p1 - p0))[:2]
-
-
-def _chain(segs, quantum):
-    """Join undirected segments into closed loops via shared endpoints."""
-    key = lambda q: (round(float(q[0]) / quantum), round(float(q[1]) / quantum))
-    at = {}
-    for i, (p, q) in enumerate(segs):
-        at.setdefault(key(p), []).append(i)
-        at.setdefault(key(q), []).append(i)
-    used = [False] * len(segs)
-    loops = []
-    for i in range(len(segs)):
-        if used[i]:
-            continue
-        used[i] = True
-        start, cur_pt = segs[i]
-        loop = [start]
-        start_key = key(start)
-        closed = False
-        for _ in range(len(segs)):
-            k = key(cur_pt)
-            if k == start_key:
-                closed = True
-                break
-            loop.append(cur_pt)
-            nxt = next((j for j in at.get(k, ()) if not used[j]), None)
-            if nxt is None:
-                break  # open chain: non-manifold input, drop it
-            used[nxt] = True
-            p, q = segs[nxt]
-            cur_pt = q if key(p) == k else p
-        if closed and len(loop) >= 3:
-            loops.append(np.array(loop))
-    return loops
-
-
-def signed_area(loop):
-    x, y = loop[:, 0], loop[:, 1]
-    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-
-
-def point_in_loop(pt, loop):
-    x, y = loop[:, 0], loop[:, 1]
-    xn, yn = np.roll(x, -1), np.roll(y, -1)
-    cond = (y > pt[1]) != (yn > pt[1])
-    with np.errstate(divide="ignore", invalid="ignore"):
-        xc = (xn - x) * (pt[1] - y) / (yn - y) + x
-    return bool(np.count_nonzero(cond & (pt[0] < xc)) % 2)
-
-
-def group_loops(loops, min_area=1e-4):
-    """Loops of one shell -> [(outer, [holes])] by nesting depth (even = outer)."""
-    loops = [lp for lp in loops if abs(signed_area(lp)) >= min_area]
-    n = len(loops)
-    contains = [[j for j in range(n) if j != i and point_in_loop(loops[i][0], loops[j])]
-                for i in range(n)]
-    depth = [len(c) for c in contains]
-    outers = [i for i in range(n) if depth[i] % 2 == 0]
-    groups = {i: [] for i in outers}
-    for i in range(n):
-        if depth[i] % 2 == 1:
-            # its outer is the container exactly one level up
-            parent = next((j for j in contains[i] if depth[j] == depth[i] - 1), None)
-            if parent is not None:
-                groups[parent].append(loops[i])
-    return [(loops[i], groups[i]) for i in outers]
+# split_shells() -> slice_soup() per layer -> group_loops() into outers with holes
+# __SUPPORTFINS_SLICE__ (build.py inlines plugins/shared/py/supportfins_slice.py here)
 
 
 # ---------------------------------------------------------------------------------
@@ -333,11 +215,9 @@ def _cfg(self):
         src = json.loads(self.get_config() or "{}")
     except (AttributeError, TypeError, ValueError):
         src = {}
-    cfg = dict(_DEFAULTS)
-    for k, v in src.items():
-        if k in cfg:
-            cfg[k] = v
-    return cfg
+    if not isinstance(src, dict):
+        src = {}
+    return {**_DEFAULTS, **src}   # unknown keys are kept: the engine refuses them by name
 
 
 def _truthy(v):
@@ -444,7 +324,7 @@ def add_fins_to_layer(layer, fin_expolys):
     return added
 
 
-def inject_fins(print_object, cfg, layer_height, unit, log=None):
+def inject_fins(print_object, cfg, layer_height, unit, log=None, nozzle=None):
     """Compute fins for one PrintObject and add them to its layers. Returns a
     short human-readable result string. If `log` is a dict it is filled with
     diagnostics (frame calibration, per-layer fin area) for the spike."""
@@ -454,9 +334,11 @@ def inject_fins(print_object, cfg, layer_height, unit, log=None):
         return "no model-part volumes"
     zmin = soup[:, :, 2].min()
     soup = soup - np.array([0.0, 0.0, zmin])       # object bottom at z = 0, like slice_z
-    fins, stats = compute_fins(soup, layer_height, cfg)
+    fins, stats = compute_fins(soup, layer_height, cfg, nozzle)
     if len(fins) == 0:
-        return "no fins needed"
+        # Quality first: no fins can still mean overhangs left bare, so say so.
+        bare = stats.get("unserved") or stats.get("floating") or stats.get("smallHoleRegions")
+        return host_report(stats) if bare else "no fins needed"
     pts = soup.reshape(-1, 3)
     bbox = print_object.bounding_box()
     frame = SliceFrame(pts[:, :2].min(axis=0), pts[:, :2].max(axis=0), bbox, unit)
@@ -490,8 +372,11 @@ def inject_fins(print_object, cfg, layer_height, unit, log=None):
         if expolys and add_fins_to_layer(layer, expolys):
             touched += 1
             log["layers"].append([round(z, 4), round(sum(e.area() for e in expolys) * unit * unit, 4)])
-    return (f"{stats.get('braces', 0)} fin(s), {stats.get('tines', 0)} tine(s) "
-            f"on {touched} layer(s)")
+    log["layers_touched"] = touched
+    report = host_report(stats)   # the same line every plugin shows
+    if touched == 0:   # placed, but no layer took them: the overhangs are still bare
+        report += "; none of it reached a layer, so nothing was added (see support_fins_log.jsonl)"
+    return report
 
 
 class SupportFinsSlicing(orca.slicing.SlicingPipelineCapabilityBase):
@@ -499,13 +384,13 @@ class SupportFinsSlicing(orca.slicing.SlicingPipelineCapabilityBase):
         return "Support Fins"
 
     def get_default_config(self):
-        return _DEFAULTS
+        return dict(_DEFAULTS)
 
     def execute(self, ctx):
         if ctx.step != orca.slicing.Step.posSlice or ctx.object is None:
             return orca.ExecutionResult.success()
         cfg = _cfg(self)
-        if not cfg["enabled"]:
+        if not _truthy(cfg["enabled"]):
             return orca.ExecutionResult.success("Support Fins: disabled in plugin config")
         if np is None:
             return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError,
@@ -517,14 +402,18 @@ class SupportFinsSlicing(orca.slicing.SlicingPipelineCapabilityBase):
             lh = float(po.config_value("layer_height") or ctx.config_value("layer_height") or 0.2)
         except (TypeError, ValueError):
             lh = 0.2
-        log = {"object_id": _safe(lambda: po.id()), "layer_height": lh, "started": time.time()}
+        nozzle = _nozzle(po, ctx)
+        log = {"object_id": _safe(lambda: po.id()), "layer_height": lh, "nozzle": nozzle, "started": time.time(),
+               "version": VERSION}
         try:
-            msg = inject_fins(po, cfg, lh, orca.slicing.unscale(1), log)
+            msg = inject_fins(po, cfg, lh, orca.slicing.unscale(1), log, nozzle=nozzle)
         except Exception as e:  # never break a slice over fins; report and carry on
             log["error"] = f"{type(e).__name__}: {e}"
             _write_log(log)
+            # a config the engine refused says so in its own words; anything else is a bug
+            why = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
             return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError,
-                                                f"Support Fins: {type(e).__name__}: {e}")
+                                                f"Support Fins: {why}")
         log["result"] = msg
         log["seconds"] = round(time.time() - log["started"], 3)
         _write_log(log)

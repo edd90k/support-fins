@@ -4,14 +4,57 @@ Fast, offline invariant tests for the geometry the tool bakes into an STL. Pure
 geometry in, triangle soup out -- so every test builds something and asserts a
 property no future change may quietly break.
 
+**`provenance.test.js`** pins the opt-in 3MF component metadata and subtraction
+source-face hints used by project processing. It checks repeated/nested parts,
+mirrored corner order, material identities and raw facet attributes, empty
+cutters, and missing/cyclic dependencies. Asking for provenance must leave the
+existing geometry and ordinary reader result unchanged. A boolean source-face
+ID is not a paint mapping: consumers still need to verify geometric containment
+before transferring triangle-relative painting to a split face.
+
 ```sh
 deno test --allow-read tests/
 ```
 
 ## What's pinned (and why it exists)
 
+**`sway_clearance.test.js`** -- square-ended Sway feet and bodies keep the 1 mm
+clearance without imaginary round caps rejecting opposite sides of a thin wall.
+Pins rotated 2/6 mm walls, cross ribs, duplicate refusal, actual overlap and gaps
+below the clearance; the existing Sway tests still refuse facing braces across an
+open channel.
+
+**`sway_cross_gauge.test.js`** -- Cross uses the actual Sway gauge at 0.2–2 mm
+nozzles and 2/4/8 wall lines, keeps the flange margin, and checks the wider body
+against the part and neighbouring supports. Pins real worker output, removal
+ownership, contact-material tags and STL/3MF geometry on a synthetic metre post.
+
 Each of these is a regression that actually shipped once. The tests are the
 fence around it.
+
+**`golden.test.js`** -- the exact supports the site builds, at its default settings,
+for a few reference scenes (Matthew's site check: `cube.stl` at X40, Auto and Draw;
+PETG; lbracket, sphere, torus, staircase; sway on a bar). Every test below pins a
+property or a count; a change that keeps every count (PR #149's wall steps, on the
+default cube) passes them all. This one hashes the geometry, so **any** change fails
+and names the scene. A change you mean: re-record and commit `tests/golden/` with the
+PR, saying why in its body -- the golden diff is how review sees the default moved:
+
+```sh
+UPDATE_GOLDEN=1 deno test -A tests/golden.test.js
+```
+
+**`tall.test.js`** -- Brace tall walls (local issue 046, `web/fins/tall.js`): a shelf
+110 mm up gets face ribs and a 60 mm one doesn't, unticked builds triangle-for-triangle
+as without the pass, every rib stands on the plate under the tip taper, none runs into
+another support, and a drawn wall gets them only with `braceTall`.
+
+**`stability.test.js`** -- the same part nudged by 1e-9 rad builds the same supports,
+on 24 scenes (local issue 023: 14 of them used to change -- an end station dropped one
+ulp off surfaceZAt's grid, a part edge in a wall's end-cap plane read as a pierce, a
+level wall's comb anchored at whichever end noise made lower). Plus the end-cap case on
+`solidClearance` directly, at nudges where the old parallel test misfired. Builds come
+from `_scene.js`, the site's exact call, shared with `golden.test.js`.
 
 **`tines.test.js`** -- `emitTines` on a controlled solid block:
 - teeth **point INTO the part**, flush with the wall's flanks -- never standing
@@ -25,6 +68,55 @@ fence around it.
   because its block put the run tangent *into* the part by construction;
 - an overhang a tooth cannot reach into gets **no tine** (no gripping air).
 
+**`nearface.test.js`** -- `nearestFaces` (`web/prop/nearface.js`), the grid each tine
+asks for the faces it aims at, gives **exactly** the full scan's answer: the same
+faces, the same ties (probes on vertices and edge midpoints), in face order, on nine
+stress models in three poses, and again after the pose changes.
+
+**`weld.test.js`** -- `buildTopology`'s weld (numeric hash tables) gives **exactly** the
+topology the old string-keyed Map did: vertex and edge counts and every adjacency pair
+in order, on every stress model, a shuffled dense grid jittered under the weld step,
+and the key edge cases (-0, half-micron rounding, NaN, huge coordinates, duplicates).
+
+**`bores.test.js`** -- bores get supported (reversed 2026-09-27 after print tests):
+- a bore's ceiling gets a **part-attached wall on the bore floor**, flagged `inBore`;
+- that wall runs **along the bore axis**, so it pulls out an open end;
+- no `bore` skip reason: a refusal is counted as `stub` / `blocked` / `buried`
+  (the old `bore` count was mostly short runs, e.g. artichoke X30's 54).
+
+**`part_wall_ends.test.js`** -- a wall standing on the part keeps its ends off the
+part's side walls (GH #119: in a recessed box the walls ran to the box's end wall and
+welded). A wall run under a lip to 0.1 mm short of the end wall: parity probing passes
+that station, the outline measurement (`welds`) trims it. A DRAWN wall (Draw, and the
+Full fill pass) trims its ends the same way (`trimmedEnds`) when given the topology.
+
+**`small_holes.test.js`** -- automatic placement honours the existing tiny-hole
+coverage exemption: recognised circular bores stay clear in Auto and Full, while
+larger bores and neighbouring overhangs keep their supports. Procedural geometry
+checks the classifier boundary, shared-plugin reporting, unchanged highlighting,
+pose-local classification, cavity keep-clear volumes ending at the actual floor,
+nearby ceilings in Full mode and the explicit Draw path. Axially subdivided
+bores reproduce coincident ray hits on CAD mesh seams, with translated X/Y bores,
+two tessellations, both seating paths, and a larger supported control. This reuses
+the existing heuristic, not an exact diameter measurement or a general removability test.
+
+**`wedge_clear.test.js`** -- a wedge never runs through the part under the face it
+holds (GH #254: a channel at 45deg got a wedge under its upper plate straight through
+the lower one, impossible to remove). A U-channel at X±45; points sampled across each
+blade triangle, since a blade through a plate has no vertex inside it.
+
+**`raster.test.js`** -- raster placement (`web/prop/raster.js`), raced per region:
+- a curved underside the tube route left bare (flat torus at X30: 4%) gets **held**;
+- a swap **never raises the lowest tine** (the part's base grip) past 0.1 mm and
+  **never drops a wedge** -- bore_bracket X45 lost its bed-gripping wedge to a raster
+  wall once (1.2 -> 22.9 mm) before `wedgeVeto`;
+- `raster: false` builds the normal pass alone;
+- tines sit **square to their wall** (along its run or straight across); an angled
+  tine is only the fallback where no square one reaches the part (raster torus X30
+  had 12 of 22 diagonal).
+Shapes: curved fixtures `tests/fixtures/{bowl,dome_ceiling,torus_flat}.stl`
+(`gen_curved.py`), plus stress models sphere/torus (they swap) and tube/portal (wedges).
+
 **`supports.test.js`** -- `buildFins` on the stress models, tilted so they place fins:
 - the fin **wall never fuses into the STL** (it clears the part by the breakaway
   gap; only tines bite in);
@@ -32,6 +124,15 @@ fence around it.
   pad is unsupported;
 - added geometry is **watertight**;
 - a tilted part gets a **tined, gripping** fin.
+
+**`low_edge.test.js`** -- a slab whose underside is a shallow cylinder (R 130, 2.2 mm
+of bow) lying on the plate gets a wall at **each edge of its low band** (where the
+underside climbs past the squat floor, ~14.6 mm out) at sparse, default and dense.
+Main put the nearest at 23.4 mm, ~9 mm of near-flat underside bare on each side
+(a customer's DRO housing on its bowed back; at the default coverage one side got
+nothing). The row is added beside the layout, never moved into it, and **no two
+squat brims fuse** -- on the slab, and on a 40 mm cube at X60Z30 sparse, where the
+first version added a squat wall 1.6 mm from the one main builds (review).
 
 **`pad.test.js`** -- the bed pad styles (FIN-SPEC "Bed pad styles"):
 - **Sure hold** is a smooth oval that conforms under a tilted part's flank, stays
@@ -46,6 +147,11 @@ fence around it.
   swapped -- and the swapped pad meets the part even on PETG numbers;
 - a **wedge foot** never runs under the part it braces (fails on the old foot,
   which crossed a cube's edge).
+
+**`suggest_worker.test.js`** -- Suggest orientation's Worker (`web/suggestworker.js`) ranks
+**exactly** as `suggestOrientations` does on this thread, on a torus with the default
+settings and with a changed Support gap sent as tunables -- and the two rankings
+differ, so the gap really reached the Worker.
 
 **`orient.test.js`** -- the orientation/strength logic behind the left rail (pure,
 no DOM), so a change to a verdict or a solver can't silently drift:
@@ -74,6 +180,22 @@ no DOM), so a change to a verdict or a solver can't silently drift:
   it **heavier** than solid -- a wall where only a speck of a hole fits stays solid;
 - a **part-standing** wall cuts too, and the pick reaches an **Auto** build through
   `opts.tunables` (the Worker has its own copy of `cutout.js`).
+
+**`interface.test.js`** -- the interface crest (GitHub #21, `web/prop/crest.js`):
+- off, **nothing is tagged** (the sweep pins off as byte-identical);
+- **everywhere**, for prop walls with tines, a wedge, Full, a cut wall, squat walls, and
+  **flat contacts** on a wall standing on the part (lifted and welded) and the portal's
+  flat ceiling: body and crest each come out **closed and outward-wound**, **lose no
+  plastic** of the one-body build (a flat crest adds only its untapered tip, < 5%), and
+  add **no zero-area triangle**;
+- flat contacts give a flat ceiling a **full-width** (th) crest, and a 35° cube's tilted
+  underside and its tines **none**;
+- the crest is **one layer** of the Layer height field (0.2 and 0.3 mm);
+- **no body vertex rises into its crest**;
+- everywhere, a **sway brace's tines** are tagged too;
+- the separate 3MF writes the crest as a **part of the supports object** (a floating
+  object of its own is refused by Orca) and reads back with every triangle; the locked
+  form folds it into the supports.
 
 **`threemf.test.js`** -- the 3MF container, both directions (the only tests here
 that aren't fin geometry, because the file format is equally part of the product):
@@ -104,9 +226,50 @@ that aren't fin geometry, because the file format is equally part of the product
 - a plate's objects come back **separately and named** (from
   `Metadata/model_settings.config`) so the caller can let the user pick which to
   fin, rather than merging a plate of distinct models into one soup;
+- a slicer's **negative parts, modifiers and support blockers** (#104) stay out of the
+  part, kept by kind with their settings in each slicer's own words, and the export
+  writes them back beside the part (never into the object holding the fins: a
+  negative part cuts every part of its object) -- Bambu/Orca and PrusaSlicer 3 as one
+  assembly named in both configs, PrusaSlicer 2 as triangle ranges of one mesh;
+  `cut.test.js` pins that each real slicer file, exported uncut with its negative
+  and opened again, cuts to the same part (or its saved session would not restore);
 - a broken file **fails loudly**: a triangle indexing a missing vertex drops that
   face alone (dropping a partial one would shear the rest of the mesh), and a
   non-ZIP or mesh-free package throws rather than opening blank.
+
+**`obj.test.js`** -- the OBJ reader in `web/obj.js` (the site and the command line):
+an indexed mesh reads back as the same triangles; quads and n-gons fan; `v/vt/vn` and
+negative references resolve; `o` splits objects (the picker / `--object`), groups and
+materials don't; the sniffer never takes a binary or ASCII STL; no faces or a dangling
+reference is an error, not an empty part.
+
+**`stl.test.js`** -- the STL reader in `web/stl.js` (the command line and these tests
+use it; the site parses with three.js's `STLLoader`):
+- our own binary export **reads back** as the same triangles, and ASCII does too;
+- binary is decided by **size**, not by a leading `solid`: CAD exporters (SolidWorks)
+  start binary headers with it, and reading one as text opens an empty part; bytes
+  left after the last triangle still read as binary, as three.js reads them;
+- ASCII with CRLF, exponents, upper-case keywords and a BOM reads;
+- a **truncated, empty or non-STL** file throws instead of opening blank.
+
+**`navpresets.test.js`** -- the Mouse menu's presets (`web/ui/navpresets.js`, #53):
+- **Default** is the old OrbitControls mapping (left orbits, right pans);
+- every preset can orbit and pan with a mouse button (a held modifier swaps the two);
+- the CAD presets (Fusion, Onshape, SolidWorks, Blender) leave **left-drag** unbound,
+  so left stays the picking button, and bind the packages' own buttons;
+- an unknown remembered key falls back to Default.
+
+**`viewpresets.test.js`** -- the View popover's camera views (`web/ui/viewpresets.js`, #350):
+- Front / Back / Left / Right / Top / Bottom each put the camera on its own side of
+  the orbit target, at the distance it was (the zoom and the spot being drawn at stay);
+- Top and Bottom lean a hair toward the front, so OrbitControls keeps a heading
+  (straight down its up axis it has none);
+- the glide between views swings round the target at the same distance (Front to
+  Back in a straight line would run through it);
+- every view has a label and a tooltip.
+- the **view cube**'s faces read upright from outside (and its middle cells are the
+  buttons' views); its 3x3 cells give 26 distinct views -- each corner on 3 faces,
+  each edge on 2; a click straight up or down leans to the front like Top/Bottom.
 
 **`step.test.js`** -- STEP import through the real vendored OpenCascade WASM (the
 same `stepObjects()` the app's worker output goes through):
@@ -120,6 +283,16 @@ same `stepObjects()` the app's worker output goes through):
 - the imported part runs through `analyze` + `buildFins` and gets a fin.
 Fixtures (`tests/fixtures/*.step`) are made with FreeCAD.
 
+**`rest.test.js`** -- `web/ui/rest.js`, the "run once the cursor rests" helper behind the Sway brace
+ghost: a burst of moves runs once with the last target after the pause; cancel (click, leaving the part) drops it.
+**`triindex.test.js`** -- Sway's lowestHit through the XY triangle grid (`web/triindex.js`,
+`web/swayhit.js`) against the full scan, `Object.is`-equal on 400 random rib boxes per scene
+over 8 scenes (hits and misses), with and without the rib's z bounds (the per-candidate box test).
+
+**`swaycrop.test.js`** -- Sway's cross ribs built from the cropped part (`web/swaycrop.js`)
+equal those built from the whole part, on random feet/leans/gauges over 5 scenes; a post click still
+gets both arms.
+
 **`sway.test.js`** -- sway braces (`web/sway.js`) on a 150 mm post (plain blocks,
 no stress models needed):
 - a tall part gets braces, watertight, and the **rib never fuses** into the part;
@@ -129,5 +302,64 @@ no stress models needed):
   refuses a roof; `buildFins` without the option is unchanged;
 - a brace straight across a channel from another is **refused**, a staggered one is not.
 
+**`plate_only.test.js`** -- Plate only (#218), every support on the build plate:
+- a drawn line with part under it is **refused, naming the setting**; over open plate
+  the wall is byte-identical;
+- Auto and Full on the portal at Y90 build **no wall on the part** and count the
+  dropped one (`skipped.onPart`), never stilting it through the part;
+- off by default, and a part with nothing over it is unchanged.
+
 See `docs/FIN-SPEC.md` for the spec these encode. `prototype/stress/run.js` is the
 broader sweep (all models × poses) for eyeballing; this suite is the pass/fail gate.
+
+`sway_depth.test.js` verifies the optional full-depth percentage on metre-high
+braces, unchanged capped/short geometry, expanded-foot collisions with the part
+and existing supports, collision-limited height/depth, real Auto worker on/off
+requests, removal ownership and STL/component-3MF export with interface tags.
+Full brace depth starts off in the browser; legacy goldens stay unchanged.
+`rounded_feet.test.js` checks inscribed corner arcs and overlapping segment joints,
+ordinary/squat/wedge/Sway bodies and interface contacts, clearance, removal ranges,
+opt-in-to-legacy reset and STL/component-3MF export on a synthetic metre-high post.
+The browser toggle starts off; legacy geometry references are unchanged. Physical
+adhesion and tall-print stability still need comparison prints.
+
+**`arc.test.js`** — arc walls (`web/prop/arc.js`): a slot through a tube's wall
+(`fixtures/gen_slot.py`: Ø30 with a 1.6 mm wall, Ø50 with 2.5 mm) gets ONE wall along its
+ceiling in Auto and in Full, bending, every station inside the strip, ≥ 95% of the ceiling
+right over it and nothing inside the part. The same slot tilted 30° slopes, so no region
+takes an arc (a slope is downhill.js's).
+
+**`end_rows.test.js`** — flush end rows as a judged candidate (`web/prop/endrows.js`): a tilted
+cube wins its four flush walls in the race; tshape at X60 (sparse) keeps its three flush
+walls on a judge tie, as `endRows:false` builds them; a portal
+keeps its wedge (the race's `hold`) where the mid-strip rows would serve its patch.
+
+**`rim.test.js`** — rim walls (`web/prop/rim.js`): a ledge off one edge, whose rows stop
+4 mm short of its free edge, gets a wall under that edge in pieces no longer than
+`RIM.pieceLen` and none along the attached edge; `rimWalls:false` and `raster:false`
+build none; a tilted face (tube X25) gets none and keeps its 4 walls; a deck laid on two
+unwelded posts reads as attached there and takes no rim.
+
+**`circular.test.js`** — local circular/annular measurements and conical-recess
+placement (`web/prop/circular.js`). `_circular.js` generates publishable closed
+fixtures independently of any supplied project. Checks translation, duplicate
+instances, Z rotations 0/5/15/30/90°, triangle order, tessellation, unchanged
+recesses on different-height bodies, genuinely different recesses, coverage
+settings, Full mode, nearby-context phase, closed meshes and shared-adapter
+agreement, including a neighbouring exempt small bore in either region order.
+Ellipses and incomplete rings retain their existing path. Circle
+counts are derived from geometry; the tests compare instances rather than pin
+an observed count. Run `deno test -A tests/circular.test.js` during iteration.
+
+**`report.test.js`** — the "Something didn't get supported?" report (`web/report.js`,
+local issue 064): the settings JSON a user files rebuilds the same fins from their file.
+A page-like request (a pose, settings off their defaults; Full coverage with the island
+starts the page passes) goes through `JSON.stringify`/`parse` and the engine is reset to
+its defaults before `replayReport`, which must give the same support and pad triangles
+and the same coverage numbers -- dropping the tunables from the JSON fails it. A part at
+150 % replays at its scale; the wrong scale, another mesh or an unknown version is
+refused. The issue link fills the `coverage-report.yml` form's `summary` and `settings`
+fields, its JSON parses back whole, and a request too long for a link points at Copy
+settings instead. Replay takes the mesh the page built on: a file the import changed
+(units, a 3MF's transforms or merged objects, STEP, negative-part cuts) must be brought to
+that mesh first, or the size / triangle-count check refuses it.

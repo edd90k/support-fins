@@ -1,0 +1,240 @@
+// Full coverage (mode 'full', web/fins/fill.js): Auto, then Draw-built walls under
+// the red Auto left bare. Pins that it only ADDS to Auto, that what it adds holds
+// more red, stays out of the part and off Auto's supports, that the coverage slider
+// sets how much it adds, that it says what it couldn't reach, and that it is
+// deterministic (counts, not a clock, bound it).
+
+import { loadModel, analyze, fins, insideCount, rotX, tiltedBlockTopo, assert } from './_util.js';
+
+const { classify, reachOf, MUST, PLATE_Z } = await import('../web/fins/coverage.js');
+const { bareArea, fillReach, FILL, FLANGE_TOP } = await import('../web/fins/fill.js');
+
+const OPTS = { bedPad: true, tines: true, tineDensity: 0, layerHeight: 0.2 };
+
+/** MUST red area within 6 mm reach of a build's wall tops (the scoreboard's must held). */
+function mustHeld(topo, res, rot, b) {
+  const tops = [];
+  for (const w of b.fins ?? []) for (const p of w.line ?? []) tops.push(p);
+  const near = reachOf(tops, 6), cls = classify(topo, res, rot), off = res.offset, P = topo.pos;
+  let held = 0, must = 0;
+  for (let f = 0; f < topo.nFaces; f++) {
+    if (!res.over[f] || cls[f] !== MUST) continue;
+    const c = [0, 1, 2].map((k) => [0, 3, 6].reduce((s, o) => s + (rot[k] * P[f * 9 + o] + rot[3 + k] * P[f * 9 + o + 1]
+      + rot[6 + k] * P[f * 9 + o + 2] + [off.x, off.y, off.z][k]) / 3, 0));
+    must += topo.area[f];
+    if (c[2] < PLATE_Z || near(c[0], c[1], c[2])) held += topo.area[f];
+  }
+  return { held, must };
+}
+
+// The staircase at X40: Auto leaves must-hold red on its treads' edges. (The cube at
+// X40 was this test's part -- Auto's three walls at the thirds left a 6.7 mm strip past
+// each end wall -- until the end walls moved out flush on every overhang, #269.)
+const topo = loadModel('staircase');
+const rot = rotX(40);
+const res = analyze(topo, 45, rot);
+const auto = fins.buildFins(topo, res, rot, { ...OPTS, mode: 'auto' });
+const full = fins.buildFins(topo, res, rot, { ...OPTS, mode: 'full' });
+
+Deno.test('fill: Full coverage keeps every Auto support, byte for byte, and only adds', () => {
+  assert(full.triangles.length >= auto.triangles.length);
+  for (let i = 0; i < auto.triangles.length; i++) {
+    const a = auto.triangles[i], b = full.triangles[i];
+    assert(a[0] === b[0] && a[1] === b[1] && a[2] === b[2], `Auto triangle vertex ${i} changed`);
+  }
+  assert(full.fins.slice(0, auto.fins.length).every((f, i) => f.id === auto.fins[i].id && !f.fill));
+  assert(full.fins.slice(auto.fins.length).every((f) => f.fill), 'added fins are flagged fill');
+});
+
+Deno.test('fill: it holds more of the must-hold red than Auto, and reports the rest', () => {
+  const a = mustHeld(topo, res, rot, auto), f = mustHeld(topo, res, rot, full);
+  assert(full.fill, 'full mode reports its fill');
+  assert(a.held < a.must - 1, 'precondition: Auto leaves the staircase at X40 some red');
+  assert(f.held > a.held, `no gain: ${a.held.toFixed(0)} -> ${f.held.toFixed(0)} of ${a.must.toFixed(0)}`);
+  assert(Number.isFinite(full.fill.unservedArea) && Array.isArray(full.fill.unservedPts));
+});
+
+Deno.test('fill: no added wall is inside the part', () => {
+  // tines off: a tine's end kisses the surface, so its vertices sit ON it (Auto's do too)
+  const o = { ...OPTS, tines: false };
+  const a = fins.buildFins(topo, res, rot, { ...o, mode: 'auto' }), f = fins.buildFins(topo, res, rot, { ...o, mode: 'full' });
+  assert(f.fill.walls > 0, 'the staircase at X40 gets fill walls');
+  const n = insideCount(topo, rot, res.offset, f.triangles.slice(a.triangles.length));
+  assert(n === 0, `${n} fill vertices inside the part`);
+});
+
+/** Fill walls within `pad` of another support: [[wall, support]] (support 0 = Auto's).
+ * `shared`: two pieces both in the plate flange band, one wholly within it, are a
+ * joined base (#196, fill.js `hits`), not a touch -- Separate walls allows none. */
+function fillTouches(auto, full, shared, pad = 0.3) {   // a hair under PROP.sideClear (0.35)
+  const box = (t, i) => [0, 1, 2].map((k) => Math.min(t[i][k], t[i + 1][k], t[i + 2][k]))
+    .concat([0, 1, 2].map((k) => Math.max(t[i][k], t[i + 1][k], t[i + 2][k])));
+  const touch = (b, o) => b[0] - pad <= o[3] && o[0] <= b[3] + pad && b[1] - pad <= o[4] && o[1] <= b[4] + pad
+    && b[2] - pad <= o[5] && o[2] <= b[5] + pad
+    && !(shared && Math.max(b[2], o[2]) <= FLANGE_TOP && Math.min(b[5], o[5]) <= FLANGE_TOP);
+  // every support as its own list of triangle boxes: Auto's as one, each fill wall apart
+  const walls = [[]], joined = [false];
+  for (let i = 0; i < auto.triangles.length; i += 3) walls[0].push(box(auto.triangles, i));
+  for (const f of full.fins.filter((w) => w.fill)) {
+    const [a, z] = f.triRanges[0], bs = [];
+    for (let i = a; i < z; i += 3) bs.push(box(full.triangles, i));
+    walls.push(bs);
+    joined.push(!!f.joined);
+  }
+  const out = [];
+  for (let w = 1; w < walls.length; w++) for (let v = 0; v < w; v++) {
+    if (v > 0 && joined[w]) continue;   // crosses or meets a fill wall on purpose: one support with it
+    if (walls[w].some((b) => walls[v].some((o) => touch(b, o)))) out.push([w, v]);
+  }
+  return { out, walls: walls.length - 1 };
+}
+
+Deno.test('fill: added walls keep sideClear off every other support, Auto\'s and each other (fused walls do not break away) -- a joined wall only off Auto\'s', () => {
+  // the staircase's fill walls share no flange: this pins them strict (wedge and portal
+  // below pin the shared flange)
+  const { out, walls } = fillTouches(auto, full, false);
+  assert(walls > 1, 'needs two fill walls to check them against each other');
+  assert(!out.length, `fill wall ${out[0]?.[0]} within 0.3 mm of support ${out[0]?.[1]}`);
+});
+
+// Wedge and portal at X40 put fill walls side by side on the plate: their flanges join
+// (#196), their stems still keep sideClear. Separate walls (the resin default) joins
+// nothing, flanges included.
+for (const name of ['wedge', 'portal']) {
+  const t = loadModel(name), r = rotX(40), a = analyze(t, 45, r);
+  const au = fins.buildFins(t, a, r, { ...OPTS, mode: 'auto' });
+  Deno.test(`fill: ${name} X40 -- fill walls share only a plate flange, and with Separate walls not even that`, () => {
+    const fdm = fillTouches(au, fins.buildFins(t, a, r, { ...OPTS, mode: 'full' }), true);
+    assert(fdm.walls > 1, `${name}: needs fill walls`);
+    assert(!fdm.out.length, `${name}: fill wall ${fdm.out[0]?.[0]} within 0.3 mm of support ${fdm.out[0]?.[1]} above the flange`);
+    const sep = fillTouches(au, fins.buildFins(t, a, r, { ...OPTS, mode: 'full', separateWalls: true }), false);
+    assert(sep.walls > 0, `${name} Separate walls: needs fill walls`);
+    assert(!sep.out.length, `${name} Separate walls: fill wall ${sep.out[0]?.[0]} within 0.3 mm of support ${sep.out[0]?.[1]}`);
+  });
+}
+
+Deno.test('fill: at every slider setting Full holds at least what Auto does, and adds a wall where Auto left red', () => {
+  // the slider also sets Auto's own rows (fewer at 0, more at 1), so the
+  // fill's count isn't monotonic -- what is: sparse still adds a wall where Auto left
+  // red, and Full coverage at any setting holds at least what Auto does
+  for (const coverage of [0, 0.5, 1]) {
+    const a = fins.buildFins(topo, res, rot, { ...OPTS, mode: 'auto', coverage });
+    const f = fins.buildFins(topo, res, rot, { ...OPTS, mode: 'full', coverage });
+    const ha = mustHeld(topo, res, rot, a), hf = mustHeld(topo, res, rot, f);
+    assert(hf.held >= ha.held - 1e-6, `coverage ${coverage}: Full holds less than Auto`);
+    if (f.fill.bareBefore > 50) assert(f.fill.walls >= 1, `coverage ${coverage}: ${f.fill.bareBefore.toFixed(0)} mm2 bare, no fill wall`);
+  }
+  assert(fillReach(0.5) === 6 && fillReach(1) === FILL.denseReach && fillReach(0) === 6);
+});
+
+Deno.test('fill: deterministic -- the same build twice', () => {
+  const again = fins.buildFins(topo, res, rot, { ...OPTS, mode: 'full' });
+  assert(again.triangles.length === full.triangles.length && again.fill.walls === full.fill.walls);
+  for (let i = 0; i < again.triangles.length; i++) {
+    const a = again.triangles[i], b = full.triangles[i];
+    assert(a[0] === b[0] && a[1] === b[1] && a[2] === b[2], `vertex ${i} differs between runs`);
+  }
+});
+
+Deno.test('fill: a cap stops it and says so', () => {
+  const keep = FILL.maxWalls;
+  FILL.maxWalls = 1;
+  try {
+    const f = fins.buildFins(topo, res, rot, { ...OPTS, mode: 'full' });
+    assert(f.fill.walls === 1 && f.fill.capped, `walls ${f.fill.walls}, capped ${f.fill.capped}`);
+    assert(f.fill.unservedArea > 0, 'the red the cap left is reported');
+  } finally { FILL.maxWalls = keep; }
+  assert(!full.fill.capped, 'uncapped at the defaults');
+});
+
+Deno.test('fill: Auto mode never runs the fill', () => {
+  assert(auto.fill === undefined);
+});
+
+// drawnLine's `under` (the fill's pick): a column through a thick slab tilted 50deg
+// meets its underside AND its top face. With the line's height guess nearer the top
+// face -- a leaning figure's curved back, where a straight guess between the ends
+// strays toward the front -- Draw's own pick takes the top face; `under` keeps the
+// underside, the red a wall is for.
+Deno.test('fill: drawnLine under=true follows the underside where the plain pick takes the top face', async () => {
+  const { drawnLine } = await import('../web/draw.js');
+  const { seatedPartTris } = await import('../web/fins/seating.js');
+  const slab = tiltedBlockTopo(-15, 15, -20, 20, -6, 6, 50);
+  const id = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const tris = seatedPartTris(slab, id, { x: 0, y: 0, z: 0 });
+  // along x at y = 0, height guess 3 mm under the top face's height there
+  const zs = (await import('../web/prop.js')).surfaceHitsAt(tris, 0, 0).sort((p, q) => p[0] - q[0]);
+  assert(zs.length === 2 && zs[0][1] < 0 && zs[1][1] > 0, `column: ${JSON.stringify(zs)}`);
+  const hint = zs[1][0] - 3;
+  assert(Math.abs(hint - zs[1][0]) < Math.abs(hint - zs[0][0]), 'precondition: the guess is nearer the top face');
+  // PART_BAND, as drawnWall's part-attached probe runs it (an unbounded band settles
+  // any line down to the lowest surface anyway)
+  const { PART_BAND } = await import('../web/prop.js');
+  const plain = drawnLine([-10, 0, hint], [10, 0, hint], tris, undefined, PART_BAND);
+  const under = drawnLine([-10, 0, hint], [10, 0, hint], tris, undefined, PART_BAND, true);
+  const mid = (l) => l[Math.floor(l.length / 2)][2];
+  assert(Math.abs(mid(plain) - zs[1][0]) < 1, `plain pick: ${mid(plain).toFixed(2)}, top ${zs[1][0].toFixed(2)}`);
+  assert(Math.abs(mid(under) - zs[0][0]) < 1, `under pick: ${mid(under).toFixed(2)}, underside ${zs[0][0].toFixed(2)}`);
+});
+
+Deno.test('fill: pass 2 walls a low ledge with a squat wall (stations under minHeight + gap used to be cut)', async () => {
+  // a 4 x 3 mm tab 1.5 mm over the plate off a block's side (a figure's cleat sole):
+  // under minHeight + gap (1.7), over the squat floor; Auto drops it as a sliver
+  const { block, buildTopology } = await import('./_util.js');
+  const pos = new Float32Array([...block(-10, 10, -10, 10, 0, 20), ...block(-2, 2, 9.99, 13, 1.5, 6)]);
+  const tab = buildTopology({ getAttribute: (k) => (k === 'position' ? { array: pos } : null) });
+  const id = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const r = analyze(tab, 45, id);
+  const a = fins.buildFins(tab, r, id, { ...OPTS, mode: 'auto' });
+  const f = fins.buildFins(tab, r, id, { ...OPTS, mode: 'full' });
+  assert(a.props.length === 0, `precondition: Auto walls the tab (${a.props.length} walls)`);
+  const fw = f.props.filter((q) => q.fill);
+  assert(fw.length === 1 && fw[0].squat, `expected one squat fill wall, got ${fw.map((q) => `h${q.height.toFixed(1)}${q.squat ? ' squat' : ''}`).join(', ') || 'none'}`);
+});
+
+Deno.test('fill: tall fill walls are tied into a frame -- ties built, outside the part, under each wall\'s tip taper', async () => {
+  const { PROP } = await import('../web/prop.js');
+  const hex = loadModel('hexprism'), rot30 = rotX(30), r = analyze(hex, 45, rot30);
+  const f = fins.buildFins(hex, r, rot30, { ...OPTS, mode: 'full' });
+  assert(f.fill.ties > 0, `the hexprism at X30 gets ties (${f.fill.ties})`);
+  let struts = 0;
+  for (const w of f.fins.filter((q) => q.fill)) {
+    // a wall's ranges: the wall, then its ribs (if any), then its ties
+    const p = f.props.find((q) => q.fill && q.line === w.line);
+    for (const [a, z] of w.triRanges.slice(p.braces ? 2 : 1)) {
+      const tie = f.triangles.slice(a, z);
+      struts += tie.length;
+      assert(insideCount(hex, rot30, r.offset, tie) === 0, 'a tie vertex inside the part');
+      const top = Math.max(...tie.map((v) => v[2])), wallTop = Math.min(...w.line.map((s) => s[2]));
+      assert(top <= wallTop - PROP.gap - PROP.tipH - 1 + 1e-6, `tie top ${top.toFixed(2)} into the tip taper (wall top ${wallTop.toFixed(2)})`);
+    }
+  }
+  assert(struts > 0, 'the ties are in the walls\' triangle ranges');
+});
+
+// built.bare (fins.js, fill.js bareArea): what the walls leave bare, for the readout.
+// Auto measures its own walls the way the fill does; Full's area is its leftover;
+// both share the same total; Draw has none.
+Deno.test('fill: built.bare says what Auto and Full leave bare, out of the same red', () => {
+  assert(auto.bare && full.bare, 'Auto and Full both report bare');
+  assert(auto.bare.total > 0 && Math.abs(auto.bare.total - full.bare.total) < 1e-6, 'one total');
+  assert(Math.abs(full.bare.area - full.fill.unservedArea) < 1e-6, 'Full: its leftover');
+  assert(Math.abs(auto.bare.area - full.fill.bareBefore) < 1e-6, 'Auto: what Full started from');
+  assert(full.bare.area < auto.bare.area, 'Full leaves less bare');
+  const draw = fins.buildFins(topo, res, rot, { ...OPTS, mode: 'draw' });
+  assert(draw.bare === undefined, 'Draw: none');
+  const cube = loadModel('cube');   // its own: analyze reuses a topology's buffers, so `res` would change
+  const flat = fins.buildFins(cube, analyze(cube, 45, rotX(0)), rotX(0), { ...OPTS, mode: 'auto' });
+  assert(flat.bare.total === 0 && flat.bare.area === 0, 'upright cube: no red, nothing bare');
+});
+
+// The page re-measures after fins are removed by hand (ui/readout.js): with the
+// build's own coverage and the walls left, every wall gone leaves all the red bare.
+Deno.test('fill: bareArea against the walls left after a removal', () => {
+  const again = bareArea(topo, res, rot, auto.bare, auto);
+  assert(Math.abs(again.area - auto.bare.area) < 1e-6, 'same walls, same number');
+  const none = bareArea(topo, res, rot, auto.bare, { fins: [] });
+  assert(Math.abs(none.area - auto.bare.total) < 1e-6, 'no walls: all bare');
+  const some = bareArea(topo, res, rot, auto.bare, { fins: auto.fins.slice(1) });
+  assert(some.area >= auto.bare.area - 1e-6 && some.area <= none.area + 1e-6, 'one removed: in between');
+});

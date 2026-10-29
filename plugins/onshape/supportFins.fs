@@ -67,16 +67,6 @@ icon::import(path : "abefb5afa905b59c44256585", version : "f6c32f7274276435879a1
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
-export enum SupportMaterial
-{
-    annotation { "Name" : "PLA" }
-    PLA,
-    annotation { "Name" : "PETG" }
-    PETG,
-    annotation { "Name" : "Custom" }
-    CUSTOM
-}
-
 export enum StabilizeMode
 {
     annotation { "Name" : "Off" }
@@ -105,34 +95,17 @@ const LAYER_BOUNDS =
     (inch)       : 0.008
 } as LengthBoundSpec;
 
+const NOZZLE_BOUNDS =
+{
+    (millimeter) : [0.2, 0.4, 0.8],
+    (inch)       : 0.016
+} as LengthBoundSpec;
+
+// the site's Support gap field: 0.1-0.4 mm, default 0.2
 const GAP_BOUNDS =
 {
-    (millimeter) : [0.05, 0.2, 2.0],
+    (millimeter) : [0.1, 0.2, 0.4],
     (inch)       : 0.008
-} as LengthBoundSpec;
-
-const PROP_BITE_BOUNDS =
-{
-    (millimeter) : [0.05, 0.5, 3.0],
-    (inch)       : 0.02
-} as LengthBoundSpec;
-
-const FIN_BITE_BOUNDS =
-{
-    (millimeter) : [0.05, 0.3, 3.0],
-    (inch)       : 0.012
-} as LengthBoundSpec;
-
-const PAD_HEIGHT_BOUNDS =
-{
-    (millimeter) : [0.1, 0.6, 3.0],
-    (inch)       : 0.02
-} as LengthBoundSpec;
-
-const PAD_GRAB_BOUNDS =
-{
-    (millimeter) : [-1.0, 0.05, 1.0],
-    (inch)       : 0.002
 } as LengthBoundSpec;
 
 const SPAN_BOUNDS =
@@ -174,7 +147,7 @@ const BED_EPS         = 0.35 * millimeter;        // a face this close to the pl
 const MIN_REGION_AREA = 12.0 * millimeter ^ 2;    // ignore slivers
 const ANGLE_EPS       = 1e-4;                     // a face exactly on the threshold is self-supporting
 
-// Overhang prop -- web/prop.js PROP
+// Overhang prop -- web/prop/config.js PROP
 const PROP_TH           = 1.0 * millimeter;       // stem thickness
 const PROP_TIP          = 0.6 * millimeter;       // contact tip thickness
 const PROP_TIP_H        = 1.5 * millimeter;       // height of the necked tip
@@ -200,7 +173,7 @@ const TINE_TOP_CLEAR    = 0.5 * millimeter;       // bare zone at a sloped wall'
 const TINE_SLOPE_MIN    = 1.0 * millimeter;       // rise before a wall counts as sloped
 const MIN_GRIP_TINES    = 3;                      // grip floor per wall
 
-// Stabilize fin -- web/fins.js FIN, web/planes.js
+// Stabilize fin -- the old web/fins.js FIN fields (since removed), web/planes.js
 const FIN_TH            = 1.2 * millimeter;       // wall thickness
 const FIN_BASE_H        = 1.0 * millimeter;       // base ellipse thickness
 const FIN_ROWS_LOW      = 8;                      // "7 or 8 low down"
@@ -225,7 +198,7 @@ const FIN_WIDE_AREA     = 1500 * millimeter ^ 2;
 const FIN_ROW_PITCH     = 55.0 * millimeter;
 const FIN_ROW_MAX       = 20;
 
-// Bed pad -- web/fins.js buildPad
+// Bed pad -- web/fins/pad.js buildPad
 const PAD_MARGIN        = 4.0 * millimeter;       // grip spread past the contact
 const PAD_MIN_AREA      = 60.0 * millimeter ^ 2;  // above this much bed contact no pad is needed
 const PAD_SEGS          = 48;
@@ -349,32 +322,13 @@ export const supportFins = defineFeature(function(context is Context, id is Id, 
                          "Description" : "Set this to your slicer's layer height. Each tine is exactly one layer tall and lined up with the layers, so it prints as a single strand that snaps clean." }
             isLength(definition.layerHeight, LAYER_BOUNDS);
 
-            annotation { "Name" : "Material", "Default" : SupportMaterial.PLA,
-                         "Description" : "Sets the clearances. PETG sticks to supports much harder than PLA, so it gets bigger gaps and shallower tines. Custom exposes every value." }
-            definition.material is SupportMaterial;
+            annotation { "Name" : "Nozzle",
+                         "Description" : "Your printer's nozzle diameter. The walls, contact tips and tines are sized in nozzle lines, so they widen for a bigger nozzle and the tines narrow for a smaller one." }
+            isLength(definition.nozzle, NOZZLE_BOUNDS);
 
-            if (definition.material == SupportMaterial.CUSTOM)
-            {
-                annotation { "Name" : "Support gap",
-                             "Description" : "Air gap between the supports and the part. Larger = easier removal, rougher underside." }
-                isLength(definition.supportGap, GAP_BOUNDS);
-
-                annotation { "Name" : "Rib tine bite",
-                             "Description" : "How far each rib tine reaches into the part. Smaller = smaller marks, weaker grip." }
-                isLength(definition.propBite, PROP_BITE_BOUNDS);
-
-                annotation { "Name" : "Side fin tine bite",
-                             "Description" : "How far each side-fin tine reaches into the part." }
-                isLength(definition.finBite, FIN_BITE_BOUNDS);
-
-                annotation { "Name" : "Base height (rib flanges + pad)",
-                             "Description" : "Height of everything lying on the bed: the rib flanges and the bed pad share it, so they meet with no step. Rounded to whole layers." }
-                isLength(definition.padHeight, PAD_HEIGHT_BOUNDS);
-
-                annotation { "Name" : "Pad grab (negative = gap)",
-                             "Description" : "How far the pad overlaps the part's underside to hold it. Negative leaves a gap instead, for easier removal." }
-                isLength(definition.padGrab, PAD_GRAB_BOUNDS);
-            }
+            annotation { "Name" : "Support gap",
+                         "Description" : "Air gap between the supports and the part. Larger = easier removal, rougher underside. PETG fuses to supports harder than PLA: try 0.3 mm." }
+            isLength(definition.supportGap, GAP_BOUNDS);
         }
 
         annotation { "Name" : "Show detected overhangs", "Default" : false,
@@ -433,13 +387,15 @@ export const supportFins = defineFeature(function(context is Context, id is Id, 
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-/** Material clearances, mirroring web/app.js MATERIAL. */
+/** Clearances: the site's defaults (web/materials.js PLA) and the Support gap. */
 function resolveConfig(definition is map) returns map
 {
+    // A feature saved before Support gap was always shown builds at the site's 0.2.
+    const gap = definition.supportGap is ValueWithUnits ? definition.supportGap : 0.2 * millimeter;
     var cfg = {
         "layer"    : definition.layerHeight,
-        "propGap"  : 0.2 * millimeter,
-        "finGap"   : 0.2 * millimeter,
+        "propGap"  : gap,
+        "finGap"   : gap,
         "propBite" : 0.5 * millimeter,
         "finBite"  : 0.30 * millimeter,
         "baseH"    : 0.6 * millimeter,   // rib flanges, squat brims and the pad: one height, no step
@@ -453,25 +409,15 @@ function resolveConfig(definition is map) returns map
         "finLean"  : definition.finMaxLean is ValueWithUnits ? definition.finMaxLean : 45 * degree
     };
 
-    if (definition.material == SupportMaterial.PETG)
-    {
-        // PETG welds to a support far harder than PLA: more clearance everywhere,
-        // and the pad stands a hair below the part instead of tacking to it.
-        cfg.propGap = 0.3 * millimeter;
-        cfg.finGap = 0.3 * millimeter;
-        cfg.finBite = 0.15 * millimeter;
-        cfg.baseH = 0.4 * millimeter;
-        cfg.padGrab = -0.1 * millimeter;
-    }
-    else if (definition.material == SupportMaterial.CUSTOM)
-    {
-        cfg.propGap = definition.supportGap;
-        cfg.finGap = definition.supportGap;
-        cfg.propBite = definition.propBite;
-        cfg.finBite = definition.finBite;
-        cfg.baseH = definition.padHeight;
-        cfg.padGrab = definition.padGrab;
-    }
+    // Every width is a 0.4 nozzle's (the same rule as the website's Nozzle field):
+    // the one-bead tine and the contact tip scale with the nozzle both ways, the
+    // walls only grow. A feature saved before the field existed builds at 0.4.
+    const k = (definition.nozzle is ValueWithUnits ? definition.nozzle : 0.4 * millimeter) / (0.4 * millimeter);
+    cfg.tineW = TINE_W * k;
+    cfg.propTip = PROP_TIP * k;
+    cfg.propTh = PROP_TH * max(1, k);
+    cfg.finTh = FIN_TH * max(1, k);
+
     // whole layers only, so the pad and the flanges it meets top out on the same layer
     cfg.baseH = max(cfg.layer, round(cfg.baseH / cfg.layer) * cfg.layer);
     return cfg;
@@ -676,7 +622,7 @@ function supportPart(context is Context, pid is Id, part is Query, bedPlane is P
 
     // ── Prop tines ───────────────────────────────────────────────────────────
     result.tines += emitBoxes(context, pid + "propTines", env, propTines,
-                              -TINE_OVERLAP, cfg.propBite, TINE_W / 2);
+                              -TINE_OVERLAP, cfg.propBite, cfg.tineW / 2);
 
     // ── Merge each support into one body, drop floaters ─────────────────────
     var merged = size(evaluateQuery(context, supQ)) < 2;
@@ -1200,7 +1146,7 @@ function buildPropWall(context is Context, wid is Id, env is map, plan is map, c
     const stemPts = concatenateArrays([[vector(r0, zero)], simplifyPolyline(stemTop, tol),
                                        [vector(rn, zero), vector(r0, zero)]]);
 
-    extrudeProfile(context, wid, "tip", plan, c, tipPts, PROP_TIP);
+    extrudeProfile(context, wid, "tip", plan, c, tipPts, env.cfg.propTip);
 
     // flange half-width scales with height but never overlaps the next wall's
     const spanCap = max(PROP_FOOT_MIN, (env.cfg.maxSpan - 1 * millimeter) / 2);
@@ -1212,7 +1158,7 @@ function buildPropWall(context is Context, wid is Id, env is map, plan is map, c
     }
     else
     {
-        extrudeProfile(context, wid, "stem", plan, c, stemPts, PROP_TH);
+        extrudeProfile(context, wid, "stem", plan, c, stemPts, env.cfg.propTh);
         const foot = max(PROP_FOOT_MIN, min(min(PROP_FOOT_MAX, spanCap), maxTop * PROP_FOOT_RATIO));
         localBox(context, wid + "flange", plan.cs,
                  vector(r0, c - foot, zero), vector(rn, c + foot, env.cfg.baseH));
@@ -1286,7 +1232,7 @@ function propTineAnchors(context is Context, env is map, plan is map, c is Value
 
     // sloped wall: anchor the comb at the lowest station that grips
     const uTop = total - min(step / 2, TINE_TOP_CLEAR);
-    var u = min(TINE_W / 2, step / 2);
+    var u = min(env.cfg.tineW / 2, step / 2);
     var anchored = false;
     while (u <= uTop && !anchored)
     {
@@ -1303,7 +1249,7 @@ function propTineAnchors(context is Context, env is map, plan is map, c is Value
         }
         if (!anchored)
         {
-            u += min(TINE_W, step / 2);
+            u += min(env.cfg.tineW, step / 2);
         }
     }
     if (!anchored)
@@ -1378,7 +1324,7 @@ function propTineAt(context is Context, env is map, plan is map, c is ValueWithU
     return { "ok" : false };
 }
 
-// ─── Stabilize fins (web/fins.js buildFin, web/planes.js) ─────────────────────
+// ─── Stabilize fins (port of the old web/fins.js buildFin; web/planes.js) ─────
 
 /**
  * A fin stands BESIDE the part, parallel to a flat near-upright face and a gap
@@ -1722,9 +1668,9 @@ function buildFinAt(context is Context, fid is Id, env is map, s is map, win is 
     const u1 = win.u1;
     const gap = env.cfg.finGap;
     const layer = env.cfg.layer;
-    const rr = FIN_TH / 2;
+    const rr = env.cfg.finTh / 2;
     const wIn = gap;
-    const wOut = gap + FIN_TH;
+    const wOut = gap + env.cfg.finTh;
 
     // height of face-frame point (w, t) above the plate: zO + w*nz + t*tz
     const tBedIn = (-s.zO - wIn * s.nz) / s.tz;
@@ -1823,7 +1769,7 @@ function buildFinAt(context is Context, fid is Id, env is map, s is map, win is 
         }
     }
 
-    const inset = min(TINE_W, (u1 - u0) / 4);
+    const inset = min(env.cfg.tineW, (u1 - u0) / 4);
     const sA = u0 + inset;
     const sB = u1 - inset;
     const nU = sB > sA ? max(2, ceil((sB - sA) / FIN_TINE_SPACING) + 1) : 1;
@@ -1852,11 +1798,11 @@ function buildFinAt(context is Context, fid is Id, env is map, s is map, win is 
 
     // tine spans from grip-deep in the wall to bite-deep in the part, measured normal to the face
     const count = emitBoxes(context, fid + "tines", env, anchors,
-                            -(gap + FIN_TINE_GRIP) / s.h, env.cfg.finBite / s.h, TINE_W / 2);
+                            -(gap + FIN_TINE_GRIP) / s.h, env.cfg.finBite / s.h, env.cfg.tineW / 2);
     return { "ok" : true, "tines" : count };
 }
 
-// ─── Bed pad (web/fins.js buildPad) ───────────────────────────────────────────
+// ─── Bed pad (web/fins/pad.js buildPad) ───────────────────────────────────────
 
 /**
  * A part tilted onto an edge has near-zero bed contact and peels before any fin

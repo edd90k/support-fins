@@ -7,7 +7,7 @@
 // And the squat bed walls must be able to carry tines at all (the base-height gate
 // was skipping every one of them).
 
-import { blockTopo, tiltedBlockTopo, prop, fins, insidePart, assert, assertClose } from './_util.js';
+import { blockTopo, tiltedBlockTopo, prop, fins, insidePart, assert, assertClose, tineBoxes } from './_util.js';
 
 const { emitTines, surfaceZAt, PROP } = prop;
 const LAYER = 0.2;   // Matthew's slicer layer height; a tine must equal exactly this
@@ -42,17 +42,28 @@ Deno.test('every tooth is exactly one layer tall and perfectly horizontal', () =
   assert(n >= 3, `need tines to test their shape, got ${n}`);
   assert(out.length === n * 36, `expected 36 verts/tine, got ${out.length / n}`);
 
-  // No slanted faces: each tooth is a box, so every triangle is either a
-  // horizontal cap (|nz|~1) or a vertical side (|nz|~0) -- never a ramp.
-  for (let t = 0; t < out.length; t += 3) {
-    const a = out[t], b = out[t + 1], c = out[t + 2];
-    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
-    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
-    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    const m = Math.hypot(nx, ny, nz) || 1;
-    const up = Math.abs(nz / m);
-    assert(up > 0.98 || up < 0.02,
-      `a tine face is slanted (|nz|=${up.toFixed(3)}) -- not a horizontal bridge`);
+  // No ramps: every tooth vertex sits on its layer's bottom or top, so each triangle
+  // is either a flat cap (all three at one height) or a side spanning the whole layer.
+  // A side may lean -- the far end follows the part's surface (kissEnds) -- but a
+  // ramp would need a face that climbs across the layer partway, i.e. a vertex in
+  // between, which this rules out.
+  for (let i = 0; i < n; i++) {
+    const zs = out.slice(i * 36, (i + 1) * 36).map((v) => v[2]);
+    const lo = Math.min(...zs), hi = Math.max(...zs);
+    for (const z of zs) {
+      assert(Math.abs(z - lo) < 1e-9 || Math.abs(z - hi) < 1e-9,
+        `tooth ${i} has a vertex at z ${z.toFixed(4)} inside its layer -- a ramp, not a horizontal bridge`);
+    }
+    for (let t = i * 36; t < (i + 1) * 36; t += 3) {
+      const tz = [out[t][2], out[t + 1][2], out[t + 2][2]];
+      if (Math.max(...tz) - Math.min(...tz) < 1e-9) {          // a cap: must face up or down
+        const a = out[t], b = out[t + 1], c = out[t + 2];
+        const nx = (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]);
+        const ny = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]);
+        const nz = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        assert(Math.abs(nz) / (Math.hypot(nx, ny, nz) || 1) > 0.98, `tooth ${i} has a slanted cap`);
+      }
+    }
   }
 
   // Each tooth spans exactly one layer in Z.
@@ -153,14 +164,10 @@ Deno.test('REGRESSION: an off-grid underside still yields one-layer tines (the c
   const n = emitTines(line, null, topo, rot, offset, out);   // default LAYER-height tine
   assert(n >= 3, `need tines to test, got ${n}`);
   let offGrid = 0, twoLayer = 0;
-  for (let i = 0; i < n; i++) {
-    let lo = Infinity, hi = -Infinity, cx = 0;
-    for (let v = i * 36; v < (i + 1) * 36; v++) {
-      if (out[v][2] < lo) lo = out[v][2];
-      if (out[v][2] > hi) hi = out[v][2];
-      cx += out[v][0];
-    }
-    cx /= 36;
+  const { tines } = tineBoxes(out);   // off the grid, so wall steps come in between
+  assert(tines.length === n, `${tines.length} tine boxes for ${n} tines`);
+  for (const { verts, lo: [, , lo], hi: [, , hi] } of tines) {
+    const cx = verts.reduce((a, v) => a + v[0], 0) / 36;
     const surf = surfaceZAt(topo.pos, cx, 0);
     if (Math.abs((surf / LAYER) - Math.round(surf / LAYER)) > 1e-3) offGrid++;
     const cells = Math.ceil(hi / LAYER - 1e-4) - Math.floor(lo / LAYER + 1e-4);

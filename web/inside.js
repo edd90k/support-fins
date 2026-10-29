@@ -3,7 +3,8 @@
  * call while dragging.
  *
  * WHY THIS EXISTS. Fin placement searches with a proximity test: does any part
- * surface cross the slab the fin sweeps (fins.js `chooseSpan`). That is cheap
+ * surface cross the slab the fin sweeps (the old fins.js `chooseSpan`, since
+ * removed; prop/clearance.js is the caller now). That is cheap
  * and it is what lets the search consider thousands of windows. It is also not
  * quite the same question as "is this fin inside the part", and the gap between
  * the two showed up as a wall buried 2.6mm into a Voron housing that every
@@ -21,12 +22,20 @@
  * test saves.
  */
 
-const GRID = 64;          // buckets per axis; 64^2 over a part is plenty
+import { gridDims } from './gridsize.js';
+
 const EPS = 1e-9;
+// solidClearance switches to the coarse grid past this many fine cells a box
+const COARSE_CELLS = 64;
 
 /**
  * Bucket every triangle by its (y, z) extent in the mesh's own frame, so a ray
  * cast along +x only has to consider the triangles in one column.
+ *
+ * Two levels. The fine grid is sized to the mesh (gridsize.js) for the point and
+ * small-box queries; `coarse` is the old fixed 64 x 64, for solidClearance's
+ * boxes around a big wall triangle, which would walk thousands of fine cells
+ * (that walk alone was half of a 512 mm figure's build).
  */
 function buildGrid(topo) {
   if (topo._insideGrid) return topo._insideGrid;
@@ -38,47 +47,52 @@ function buildGrid(topo) {
     if (y < minY) minY = y; if (y > maxY) maxY = y;
     if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
   }
-  const sy = GRID / Math.max(1e-6, maxY - minY);
-  const sz = GRID / Math.max(1e-6, maxZ - minZ);
-  const cell = (y, z) => {
-    const a = Math.min(GRID - 1, Math.max(0, Math.floor((y - minY) * sy)));
-    const b = Math.min(GRID - 1, Math.max(0, Math.floor((z - minZ) * sz)));
-    return a * GRID + b;
+  const [NY, NZ] = gridDims(maxY - minY, maxZ - minZ, nFaces);
+  const grid = bucketYZ(pos, nFaces, minY, maxY, minZ, maxZ, NY, NZ);
+  grid.cell = (y, z) => {
+    const a = Math.min(NY - 1, Math.max(0, Math.floor((y - minY) * grid.sy)));
+    const b = Math.min(NZ - 1, Math.max(0, Math.floor((z - minZ) * grid.sz)));
+    return a * NZ + b;
   };
+  grid.coarse = NY === 64 && NZ === 64
+    ? grid : bucketYZ(pos, nFaces, minY, maxY, minZ, maxZ, 64, 64);
+  return (topo._insideGrid = grid);
+}
 
-  // counting sort into CSR, so there is one flat Int32Array rather than 4096
-  // little arrays
-  const counts = new Int32Array(GRID * GRID + 1);
+/** NY x NZ cells over [minY, maxY] x [minZ, maxZ], as CSR (one flat Int32Array
+ *  rather than a little array per cell), each cell's faces ascending. */
+function bucketYZ(pos, nFaces, minY, maxY, minZ, maxZ, NY, NZ) {
+  const sy = NY / Math.max(1e-6, maxY - minY);
+  const sz = NZ / Math.max(1e-6, maxZ - minZ);
+  const counts = new Int32Array(NY * NZ + 1);
   const span = (f) => {
     const o = f * 9;
     const y0 = Math.min(pos[o + 1], pos[o + 4], pos[o + 7]);
     const y1 = Math.max(pos[o + 1], pos[o + 4], pos[o + 7]);
     const z0 = Math.min(pos[o + 2], pos[o + 5], pos[o + 8]);
     const z1 = Math.max(pos[o + 2], pos[o + 5], pos[o + 8]);
-    return [Math.min(GRID - 1, Math.max(0, Math.floor((y0 - minY) * sy))),
-            Math.min(GRID - 1, Math.max(0, Math.floor((y1 - minY) * sy))),
-            Math.min(GRID - 1, Math.max(0, Math.floor((z0 - minZ) * sz))),
-            Math.min(GRID - 1, Math.max(0, Math.floor((z1 - minZ) * sz)))];
+    return [Math.min(NY - 1, Math.max(0, Math.floor((y0 - minY) * sy))),
+            Math.min(NY - 1, Math.max(0, Math.floor((y1 - minY) * sy))),
+            Math.min(NZ - 1, Math.max(0, Math.floor((z0 - minZ) * sz))),
+            Math.min(NZ - 1, Math.max(0, Math.floor((z1 - minZ) * sz)))];
   };
 
   for (let f = 0; f < nFaces; f++) {
     const [a0, a1, b0, b1] = span(f);
     for (let a = a0; a <= a1; a++) {
-      for (let b = b0; b <= b1; b++) counts[a * GRID + b + 1]++;
+      for (let b = b0; b <= b1; b++) counts[a * NZ + b + 1]++;
     }
   }
-  for (let i = 0; i < GRID * GRID; i++) counts[i + 1] += counts[i];
-  const items = new Int32Array(counts[GRID * GRID]);
-  const cur = counts.slice(0, GRID * GRID);
+  for (let i = 0; i < NY * NZ; i++) counts[i + 1] += counts[i];
+  const items = new Int32Array(counts[NY * NZ]);
+  const cur = counts.slice(0, NY * NZ);
   for (let f = 0; f < nFaces; f++) {
     const [a0, a1, b0, b1] = span(f);
     for (let a = a0; a <= a1; a++) {
-      for (let b = b0; b <= b1; b++) items[cur[a * GRID + b]++] = f;
+      for (let b = b0; b <= b1; b++) items[cur[a * NZ + b]++] = f;
     }
   }
-
-  return (topo._insideGrid = { start: counts, items, cell,
-                               minY, minZ, sy, sz });
+  return { start: counts, items, minY, minZ, sy, sz, NY, NZ };
 }
 
 /** Closest point on triangle `f` to (px, py, pz), all in the mesh's own frame. */
@@ -145,8 +159,8 @@ function triClosest(pos, f, px, py, pz) {
  * interface (above, meant to be `gap` away) from a flank approach (sideways,
  * meant to be clear). Same 0.7 cone the checker uses.
  *
- * Bounded by `rMax` so the grid's 3x3 cell neighbourhood suffices; with 64
- * cells per axis on real parts a cell is well over 0.5mm. Triangles spanning
+ * Bounded by `rMax`, so only the cells within reach are walked (gridsize.js
+ * keeps a cell at least 0.5mm). Triangles spanning
  * several cells are tested more than once rather than deduplicated -- a repeat
  * distance test is cheaper than the bookkeeping.
  */
@@ -159,16 +173,17 @@ export function nearestPart(topo, rot, offset, qx, qy, qz, rMax = 0.45) {
   const oy = rot[3] * x + rot[4] * y + rot[5] * z;
   const oz = rot[6] * x + rot[7] * y + rot[8] * z;
 
-  const clamp = (v) => Math.min(GRID - 1, Math.max(0, v));
-  const a0 = clamp(Math.floor((oy - rMax - grid.minY) * grid.sy));
-  const a1 = clamp(Math.floor((oy + rMax - grid.minY) * grid.sy));
-  const b0 = clamp(Math.floor((oz - rMax - grid.minZ) * grid.sz));
-  const b1 = clamp(Math.floor((oz + rMax - grid.minZ) * grid.sz));
+  const clampA = (v) => Math.min(grid.NY - 1, Math.max(0, v));
+  const clampB = (v) => Math.min(grid.NZ - 1, Math.max(0, v));
+  const a0 = clampA(Math.floor((oy - rMax - grid.minY) * grid.sy));
+  const a1 = clampA(Math.floor((oy + rMax - grid.minY) * grid.sy));
+  const b0 = clampB(Math.floor((oz - rMax - grid.minZ) * grid.sz));
+  const b1 = clampB(Math.floor((oz + rMax - grid.minZ) * grid.sz));
 
   let best = rMax * rMax, bx = 0, by = 0, bz = 0, found = false;
   for (let a = a0; a <= a1; a++) {
     for (let b = b0; b <= b1; b++) {
-      const c = a * GRID + b;
+      const c = a * grid.NZ + b;
       for (let i = grid.start[c]; i < grid.start[c + 1]; i++) {
         const q = triClosest(pos, grid.items[i], ox, oy, oz);
         const dx = q[0] - ox, dy = q[1] - oy, dz = q[2] - oz;
@@ -247,7 +262,38 @@ const dist2 = (p, q) => {
 export function solidClearance(topo, rot, offset, verts, rMax = 0.45) {
   const { pos } = topo;
   const grid = buildGrid(topo);
-  const clamp = (v) => Math.min(GRID - 1, Math.max(0, v));
+  const clampA = (v) => Math.min(grid.NY - 1, Math.max(0, v));
+  const clampB = (v) => Math.min(grid.NZ - 1, Math.max(0, v));
+
+  // The first part triangle wall triangle A pierces, in the coarse grid's cell
+  // order -- the walk below with the box rejects, on the old 64 x 64 layout.
+  const coarsePierce = (A, xLo, xHi, yLo, yHi, zLo, zHi) => {
+    const g = grid.coarse, done = new Set();
+    const cA = (v) => Math.min(g.NY - 1, Math.max(0, v));
+    const cB = (v) => Math.min(g.NZ - 1, Math.max(0, v));
+    const a0 = cA(Math.floor((yLo - rMax - g.minY) * g.sy)), a1 = cA(Math.floor((yHi + rMax - g.minY) * g.sy));
+    const b0 = cB(Math.floor((zLo - rMax - g.minZ) * g.sz)), b1 = cB(Math.floor((zHi + rMax - g.minZ) * g.sz));
+    for (let a = a0; a <= a1; a++) {
+      for (let b = b0; b <= b1; b++) {
+        const c = a * g.NZ + b;
+        for (let i = g.start[c]; i < g.start[c + 1]; i++) {
+          const f = g.items[i];
+          if (done.has(f)) continue;
+          done.add(f);
+          const o = f * 9;
+          if (Math.min(pos[o], pos[o + 3], pos[o + 6]) > xHi + rMax) continue;
+          if (Math.max(pos[o], pos[o + 3], pos[o + 6]) < xLo - rMax) continue;
+          if (Math.min(pos[o + 1], pos[o + 4], pos[o + 7]) > yHi + rMax) continue;
+          if (Math.max(pos[o + 1], pos[o + 4], pos[o + 7]) < yLo - rMax) continue;
+          if (Math.min(pos[o + 2], pos[o + 5], pos[o + 8]) > zHi + rMax) continue;
+          if (Math.max(pos[o + 2], pos[o + 5], pos[o + 8]) < zLo - rMax) continue;
+          const hit = triTriPierce(A, triVerts(pos, f));
+          if (hit) return hit;
+        }
+      }
+    }
+    return null;   // unreachable: the fine walk found a pierce among the same candidates
+  };
 
   // un-rotate the solid's vertices into the mesh frame once
   const mv = new Array(verts.length);
@@ -287,16 +333,28 @@ export function solidClearance(topo, rot, offset, verts, rMax = 0.45) {
       if (q[1] < yLo) yLo = q[1]; if (q[1] > yHi) yHi = q[1];
       if (q[2] < zLo) zLo = q[2]; if (q[2] > zHi) zHi = q[2];
     }
-    const a0 = clamp(Math.floor((yLo - rMax - grid.minY) * grid.sy));
-    const a1 = clamp(Math.floor((yHi + rMax - grid.minY) * grid.sy));
-    const b0 = clamp(Math.floor((zLo - rMax - grid.minZ) * grid.sz));
-    const b1 = clamp(Math.floor((zHi + rMax - grid.minZ) * grid.sz));
+    // the fine grid unless this triangle's box spans more than COARSE_CELLS of
+    // it; then the coarse one (fewer, fuller cells beat a walk of empty ones)
+    let g = grid;
+    let a0 = clampA(Math.floor((yLo - rMax - g.minY) * g.sy));
+    let a1 = clampA(Math.floor((yHi + rMax - g.minY) * g.sy));
+    let b0 = clampB(Math.floor((zLo - rMax - g.minZ) * g.sz));
+    let b1 = clampB(Math.floor((zHi + rMax - g.minZ) * g.sz));
+    if ((a1 - a0 + 1) * (b1 - b0 + 1) > COARSE_CELLS) {
+      g = grid.coarse;
+      const cA = (v) => Math.min(g.NY - 1, Math.max(0, v));
+      const cB = (v) => Math.min(g.NZ - 1, Math.max(0, v));
+      a0 = cA(Math.floor((yLo - rMax - g.minY) * g.sy));
+      a1 = cA(Math.floor((yHi + rMax - g.minY) * g.sy));
+      b0 = cB(Math.floor((zLo - rMax - g.minZ) * g.sz));
+      b1 = cB(Math.floor((zHi + rMax - g.minZ) * g.sz));
+    }
 
     for (let a = a0; a <= a1; a++) {
       for (let b = b0; b <= b1; b++) {
-        const c = a * GRID + b;
-        for (let i = grid.start[c]; i < grid.start[c + 1]; i++) {
-          const f = grid.items[i];
+        const c = a * g.NZ + b;
+        for (let i = g.start[c]; i < g.start[c + 1]; i++) {
+          const f = g.items[i];
           if (seen[f] === gen) continue;   // this part tri already measured vs this wall tri
           seen[f] = gen;
           const o = f * 9;
@@ -324,8 +382,12 @@ export function solidClearance(topo, rot, offset, verts, rMax = 0.45) {
           // and edge-edge pair measures finite -- which is exactly how a wall
           // whose end cap ran 0.85mm into a part face was certified "0.167mm
           // clear" while the checker read 0.001.
-          const pierce = triTriPierce(A, B);
+          let pierce = triTriPierce(A, B);
           if (pierce) {
+            // Which pierce is reported (callers trim the station nearest it)
+            // depends on the order the cells are walked. Report the one the old
+            // 64 x 64 walk met first, so the trim is the same at any grid size.
+            if (g !== grid.coarse) pierce = coarsePierce(A, xLo, xHi, yLo, yHi, zLo, zHi);
             best = 0; bp = pierce; bq = pierce;
             a = a1 + 1; b = b1 + 1; t = mv.length;   // nothing beats zero
             break;
@@ -376,7 +438,13 @@ function segTriHit(p, q, A, B, C) {
   const hy = dz * e2x - dx * e2z;
   const hz = dx * e2y - dy * e2x;
   const a = e1x * hx + e1y * hy + e1z * hz;
-  if (Math.abs(a) < 1e-12) return null;   // parallel; grazing is distance work
+  // parallel; grazing is distance work. Relative to the lengths: `a` is a triple
+  // product (mm^3), and an edge lying IN the triangle's plane measures ~1e-12 of
+  // rounding on mm-sized parts -- past an absolute 1e-12 it read as a pierce at a
+  // garbage point (cube X40: a wall's end cap in the plane of the part's top edge,
+  // 0.2 mm clear, trimmed as a weld under a 1e-9 rad nudge; local issue 023).
+  const scale = Math.hypot(dx, dy, dz) * Math.hypot(e1x, e1y, e1z) * Math.hypot(e2x, e2y, e2z);
+  if (Math.abs(a) <= 1e-9 * scale) return null;
   const f = 1 / a;
   const sx = p[0] - A[0], sy = p[1] - A[1], sz = p[2] - A[2];
   const u = f * (sx * hx + sy * hy + sz * hz);
